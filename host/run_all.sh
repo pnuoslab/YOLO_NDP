@@ -92,6 +92,24 @@ CSV="$RESULTS/results.csv"
 RUN_BASE=$(( ($(date +%s) % 100000) * 10000 ))
 SEQNO=0
 
+# ssh to the target. Two things matter for an unattended multi-hour run:
+#  - BatchMode=yes: with no usable key, plain ssh stops and asks for a
+#    password, which would freeze the matrix at its first run. BatchMode
+#    makes it fail at once instead, so the run continues with empty target
+#    columns rather than hanging.
+#  - It runs as the invoking user, not root. The script itself runs under
+#    sudo, and ssh takes its keys from the passwd home directory - /root -
+#    not from $HOME, so as root it would not find the user's key.
+SSH_AS=${SSH_AS:-${SUDO_USER:-}}
+tssh() {
+  local -a cmd=(ssh -o BatchMode=yes -o ConnectTimeout=5 "$TARGET_HOST" "$@")
+  if [ "$(id -u)" -eq 0 ] && [ -n "$SSH_AS" ] && [ "$SSH_AS" != root ]; then
+    sudo -u "$SSH_AS" "${cmd[@]}"
+  else
+    "${cmd[@]}"
+  fi
+}
+
 # ── environment record ────────────────────────────────────────────────
 ENVTXT="$RESULTS/env.txt"
 {
@@ -121,7 +139,7 @@ ENVTXT="$RESULTS/env.txt"
   echo
   if [ -n "$TARGET_HOST" ]; then
     echo "── target ($TARGET_HOST) ──"
-    ssh -o ConnectTimeout=5 "$TARGET_HOST" \
+    tssh \
       "uname -r; $TARGET_RPC spdk_get_version 2>/dev/null | head -20; \
        git -C /root/spdk log -1 --format='%H %ci %s' 2>/dev/null" 2>&1
   else
@@ -141,14 +159,14 @@ host_stat() { cat "/sys/block/$BLOCK_DEV/stat" > "$1" 2>/dev/null || : > "$1"; }
 tgt_iostat() {
   : > "$1"
   [ -n "$TARGET_HOST" ] || return 0
-  ssh -o ConnectTimeout=5 "$TARGET_HOST" \
+  tssh \
       "$TARGET_RPC bdev_get_iostat" > "$1" 2>/dev/null || : > "$1"
 }
 
 tgt_measure() {   # $1=outfile $2=run_id
   : > "$1"
   [ -n "$TARGET_HOST" ] || return 0
-  ssh -o ConnectTimeout=5 "$TARGET_HOST" \
+  tssh \
       "grep -F 'run_id=$2' '$TARGET_LOG' | grep -F '[NDP-MEASURE]' | tail -1" \
       > "$1" 2>/dev/null || : > "$1"
 }
