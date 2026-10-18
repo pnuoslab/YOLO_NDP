@@ -29,6 +29,15 @@ def main():
                     help="최소 visibility (기본 0.25)")
     ap.add_argument("--emit-empty", action="store_true",
                     help="객체가 없는 프레임도 빈 .txt 로 생성 (권장)")
+    ap.add_argument("--width", type=int, default=0,
+                    help="정규화에 쓸 폭을 seqinfo.ini 값 대신 지정. "
+                         "영상화할 때 패딩이 들어간 경우에 쓴다. darknet 은 "
+                         "영상의 실제 폭으로 박스를 정규화하므로, 라벨도 "
+                         "같은 폭으로 정규화해야 어긋나지 않는다 "
+                         "(예: MOT20-03 은 1173 이 홀수라 yuv420p "
+                         "H.264 로 인코딩되지 않아 1174 로 패딩한다)")
+    ap.add_argument("--height", type=int, default=0,
+                    help="정규화에 쓸 높이를 seqinfo.ini 값 대신 지정")
     args = ap.parse_args()
 
     gt_path = os.path.join(args.seq, "gt", "gt.txt")
@@ -47,9 +56,18 @@ def main():
     else:
         sys.exit(f"[ERR] not found: {ini_path}")
 
+    # 클리핑은 항상 원본 프레임 경계(seqinfo 값)로 한다. 패딩으로 늘어난
+    # 영역은 검은 띠이고 거기에 객체가 있을 수 없으므로, 클리핑 경계를
+    # 늘리면 프레임 밖 박스를 잘못 살려두게 된다.
+    CLIP_W, CLIP_H = W, H
+    if args.width:
+        W = args.width
+    if args.height:
+        H = args.height
+
     keep = {int(x) for x in args.person_classes.split(",")}
-    print(f"[INFO] {os.path.basename(args.seq)}  {W}x{H}  "
-          f"{n_frames} frames @ {fps}fps")
+    print(f"[INFO] {os.path.basename(args.seq)}  clip={CLIP_W}x{CLIP_H}  "
+          f"normalise={W}x{H}  {n_frames} frames @ {fps}fps")
     print(f"[INFO] keep MOT classes {sorted(keep)}, visibility >= {args.min_vis}")
 
     # ── 파싱 ──────────────────────────────────────────────────────────
@@ -77,7 +95,7 @@ def main():
 
             # MOT 박스는 프레임 밖으로 나갈 수 있으므로 클리핑
             x0, y0 = max(0.0, x), max(0.0, y)
-            x1, y1 = min(float(W), x + w), min(float(H), y + h)
+            x1, y1 = min(float(CLIP_W), x + w), min(float(CLIP_H), y + h)
             if x1 <= x0 or y1 <= y0:
                 continue
             if (x0, y0, x1, y1) != (x, y, x + w, y + h):
