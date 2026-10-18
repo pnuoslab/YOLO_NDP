@@ -17,6 +17,14 @@ C_SRCS-$(CONFIG_RDMA) += rdma.c
 C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
 
 LIBNAME = nvmf
+
+# Temporary ordinary-read/write tracing in ctrlr_bdev.c. Off unless asked for:
+#   make NDP_IO_TRACE=1 -j`nproc`   (tracing build, test only)
+#   make -j`nproc`                  (measurement build)
+ifeq ($(NDP_IO_TRACE),1)
+CFLAGS += -DNDP_IO_TRACE=1
+endif
+
 LOCAL_SYS_LIBS = -lm -lavformat -lavcodec -lavutil -lswscale -ljpeg -lpthread  -lopencv_imgproc -lopencv_core -lstdc++
 CXX_SRCS = ndp_cv.cpp
 CXXFLAGS += $(shell pkg-config --cflags opencv4)

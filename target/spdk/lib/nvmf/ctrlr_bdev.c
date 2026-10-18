@@ -35,6 +35,165 @@
 #include <libswscale/swscale.h>
 #include <jpeglib.h>
 
+/*
+ * ---------------------------------------------------------------------------
+ * NDP measurement helpers
+ *
+ * Everything below runs either on the reactor thread at 0xC0 entry/completion
+ * or in the worker outside the per-frame loop. Nothing here is called from
+ * inside the decode loop, so the measured stages are not perturbed.
+ * ---------------------------------------------------------------------------
+ */
+
+/* Elapsed wall time between two CLOCK_MONOTONIC samples, in milliseconds. */
+static inline double
+ndp_ms_between(const struct timespec *a, const struct timespec *b)
+{
+	return (b->tv_sec - a->tv_sec) * 1000.0 +
+	       (b->tv_nsec - a->tv_nsec) / 1.0e6;
+}
+
+/* struct timeval (getrusage) -> seconds. */
+static inline double
+ndp_tv_sec(const struct timeval *tv)
+{
+	return (double)tv->tv_sec + (double)tv->tv_usec / 1.0e6;
+}
+
+/*
+ * One field out of /proc/self/status, in kB. Returns -1 when absent.
+ * Used for VmRSS / VmHWM / HugetlbPages.
+ */
+static long
+ndp_proc_status_kb(const char *key)
+{
+	FILE *sf = fopen("/proc/self/status", "r");
+	char  line[256];
+	long  val = -1;
+	size_t klen;
+
+	if (!sf) {
+		return -1;
+	}
+	klen = strlen(key);
+	while (fgets(line, sizeof(line), sf)) {
+		if (strncmp(line, key, klen) == 0) {
+			if (sscanf(line + klen, " %ld", &val) != 1) {
+				val = -1;
+			}
+			break;
+		}
+	}
+	fclose(sf);
+	return val;
+}
+
+/*
+ * Reset this process's peak RSS (VmHWM) down to the current VmRSS, so that the
+ * VmHWM read at completion reflects only what the 0xC0 in flight allocated.
+ * Writing "5" to clear_refs is the documented way to do this; verified working
+ * on this host (6.8.0-87-generic). Returns true if the write succeeded.
+ */
+static bool
+ndp_reset_peak_rss(void)
+{
+	FILE *f = fopen("/proc/self/clear_refs", "w");
+
+	if (!f) {
+		return false;
+	}
+	if (fputs("5", f) < 0) {
+		fclose(f);
+		return false;
+	}
+	return fclose(f) == 0;
+}
+
+/*
+ * Process-wide CPU time (user+sys) including threads that have already exited.
+ * The preprocessing worker and libavcodec's frame threads are created and
+ * joined inside one 0xC0, so RUSAGE_SELF is the only accounting that still
+ * sees them at completion time.
+ */
+static void
+ndp_read_proc_cpu(double *user_s, double *sys_s)
+{
+	struct rusage ru;
+
+	if (getrusage(RUSAGE_SELF, &ru) != 0) {
+		*user_s = *sys_s = -1.0;
+		return;
+	}
+	*user_s = ndp_tv_sec(&ru.ru_utime);
+	*sys_s  = ndp_tv_sec(&ru.ru_stime);
+}
+
+/* CPU time consumed by the calling thread only (the reactor, in our use). */
+static double
+ndp_read_thread_cpu(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+		return -1.0;
+	}
+	return (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * NDP_IO_TRACE - temporary instrumentation, compiled out by default.
+ *
+ * Confirms that ordinary NVMe read/write from the host really traverses this
+ * target's bdev path. Counters only; the summary line is rate-limited to one
+ * per second or one per 1000 commands, never one per I/O.
+ *
+ * Build with tracing:    make NDP_IO_TRACE=1 -j`nproc`
+ * Build for measurement: make -j`nproc`          (NDP_IO_TRACE defaults to 0)
+ * ---------------------------------------------------------------------------
+ */
+#ifndef NDP_IO_TRACE
+#define NDP_IO_TRACE 0
+#endif
+
+#if NDP_IO_TRACE
+static uint64_t g_io_trace_read_ops;
+static uint64_t g_io_trace_read_blocks;
+static uint64_t g_io_trace_write_ops;
+static uint64_t g_io_trace_write_blocks;
+static time_t   g_io_trace_last_report;
+
+static void
+ndp_io_trace_note(bool is_write, uint64_t num_blocks)
+{
+	uint64_t total_ops;
+	time_t   now;
+
+	if (is_write) {
+		g_io_trace_write_ops++;
+		g_io_trace_write_blocks += num_blocks;
+	} else {
+		g_io_trace_read_ops++;
+		g_io_trace_read_blocks += num_blocks;
+	}
+
+	total_ops = g_io_trace_read_ops + g_io_trace_write_ops;
+	now = time(NULL);
+	if (now == g_io_trace_last_report && (total_ops % 1000) != 0) {
+		return;
+	}
+	g_io_trace_last_report = now;
+
+	SPDK_NOTICELOG("[NDP-IOTRACE] read_ops=%" PRIu64 " read_blocks=%" PRIu64
+		       " write_ops=%" PRIu64 " write_blocks=%" PRIu64 "\n",
+		       g_io_trace_read_ops, g_io_trace_read_blocks,
+		       g_io_trace_write_ops, g_io_trace_write_blocks);
+}
+#define NDP_IO_TRACE_NOTE(is_write, nblocks) ndp_io_trace_note((is_write), (nblocks))
+#else
+#define NDP_IO_TRACE_NOTE(is_write, nblocks) do { } while (0)
+#endif
+
 struct custom_grep_ctx {
     struct spdk_nvmf_request *req;
     char *buffer;
@@ -555,6 +714,8 @@ nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 
 	assert(!spdk_nvmf_request_using_zcopy(req));
 
+	NDP_IO_TRACE_NOTE(false, num_blocks);
+
 	rc = spdk_bdev_readv_blocks_ext(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 					nvmf_bdev_ctrlr_complete_cmd, req, &opts);
 	if (spdk_unlikely(rc)) {
@@ -614,6 +775,8 @@ nvmf_bdev_ctrlr_write_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 	}
 
 	assert(!spdk_nvmf_request_using_zcopy(req));
+
+	NDP_IO_TRACE_NOTE(true, num_blocks);
 
 	rc = spdk_bdev_writev_blocks_ext(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 					 nvmf_bdev_ctrlr_complete_cmd, req, &opts);
@@ -1174,6 +1337,17 @@ struct ndp_request_ctx {
     uint32_t jpeg_quality;     /* cdw12[7:0],  0 falls back to 85 */
     uint32_t chroma_444;       /* cdw12[8],    0 = 4:2:0 (default) */
     uint32_t darknet_kernel;   /* cdw12[9],    1 = darknet-compatible resize */
+    uint32_t run_id;           /* cdw13, echoed back so the host can pair logs */
+
+    /* Measurement state, all written on the reactor thread. */
+    struct timespec ssd_read_start;   /* just before the first bdev read */
+    double   ssd_read_ms;             /* until the last extent completes */
+    uint64_t ssd_read_bytes;
+    double   cpu_user_start;          /* RUSAGE_SELF at 0xC0 entry */
+    double   cpu_sys_start;
+    double   cpu_reactor_start;       /* reactor thread CPU at 0xC0 entry */
+    long     rss_entry_kb;            /* VmRSS at 0xC0 entry, after peak reset */
+    bool     peak_rss_reset_ok;
 };
 
 struct buffer_data {
@@ -1436,6 +1610,26 @@ struct ndp_offload_ctx {
     uint16_t  net_w;
     uint16_t  net_h;
     int       sc;             /* NVMe status code: 0=success, else error */
+
+    /*
+     * Worker-side measurements. [NDP-MEASURE] used to be emitted by the
+     * worker, but the storage CPU figure can only be closed out on the
+     * reactor at completion time, so the worker parks its numbers here and
+     * the completion handler prints the single summary line.
+     */
+    int       m_jpeg_q;           /* -1 for raw RGB24 */
+    int       m_chroma_444;
+    int       m_darknet;
+    int       m_sample_rate;
+    int       m_frames;
+    int       m_sampled;
+    double    m_decode_s;
+    double    m_letterbox_s;
+    double    m_encode_s;
+    double    m_pre_total_s;
+    double    m_serialize_ms;     /* result buffer alloc + per-frame memcpy */
+    size_t    m_payload_bytes;    /* accumulated per-frame payloads */
+    size_t    m_peak_bytes;       /* manual high-water mark */
 };
 
 static void
@@ -1460,6 +1654,80 @@ preprocess_done_on_spdk_thread(void *arg)
  
         SPDK_NOTICELOG("[NDP] Preprocess complete: %u frames, %u bytes (cdw0=%u)\n",
                        off->sampled_count, off->result_size, rsp->cdw0);
+
+        /*
+         * Close out the whole-request measurements and emit the single
+         * summary line. This is the last point at which the worker and
+         * libavcodec's frame threads have exited but the request has not yet
+         * been completed, so RUSAGE_SELF has absorbed all of their CPU time.
+         *
+         * storage_cpu = d(process user+sys) - d(reactor thread CPU). The
+         * reactor busy-polls at 100%, so its own time must come out or it
+         * would swamp the figure. user and sys are reported separately as
+         * raw process deltas; the reactor share cannot be split between them,
+         * so it is only subtracted from the combined total.
+         */
+        struct ndp_request_ctx *mctx = off->ndp_ctx;
+
+        if (mctx) {
+            double cpu_user1 = 0.0, cpu_sys1 = 0.0;
+            ndp_read_proc_cpu(&cpu_user1, &cpu_sys1);
+            double cpu_reactor1 = ndp_read_thread_cpu();
+
+            double d_user    = cpu_user1 - mctx->cpu_user_start;
+            double d_sys     = cpu_sys1  - mctx->cpu_sys_start;
+            double d_reactor = (cpu_reactor1 >= 0.0 && mctx->cpu_reactor_start >= 0.0)
+                               ? cpu_reactor1 - mctx->cpu_reactor_start : -1.0;
+            double cpu_storage = (d_reactor >= 0.0)
+                                 ? (d_user + d_sys) - d_reactor : -1.0;
+
+            /*
+             * Hugepage-backed DMA buffers (the compressed-video read buffer
+             * and the result blob) are NOT part of VmRSS/VmHWM - the kernel
+             * accounts hugetlb separately. So the three memory terms below
+             * are disjoint and may legitimately be summed.
+             */
+            double dma_readbuf_mb = (double)mctx->total_video_size / (1024.0 * 1024.0);
+            double dma_blob_mb    = (double)off->result_size / (1024.0 * 1024.0);
+
+            long   vmhwm_kb = ndp_proc_status_kb("VmHWM:");
+            double heap_peak_delta_mb = -1.0;
+            if (mctx->peak_rss_reset_ok && vmhwm_kb >= 0 && mctx->rss_entry_kb >= 0) {
+                long d_kb = vmhwm_kb - mctx->rss_entry_kb;
+                if (d_kb < 0) d_kb = 0;
+                heap_peak_delta_mb = (double)d_kb / 1024.0;
+            }
+            double storage_mem_total_mb =
+                (heap_peak_delta_mb >= 0.0)
+                ? dma_readbuf_mb + dma_blob_mb + heap_peak_delta_mb : -1.0;
+
+            SPDK_NOTICELOG("[NDP-MEASURE] run_id=%u q=%d chroma=%s resize=%s sample_rate=%d "
+                           "frames=%d sampled=%d decode=%.3f letterbox=%.3f "
+                           "encode=%.3f pre_total=%.3f bytes=%u frame_avg=%.1f "
+                           "readbuf_mb=%.1f payload_mb=%.1f blob_mb=%.1f peak_mb=%.1f "
+                           "vmhwm_mb=%.1f "
+                           "ssd_read_ms=%.3f ssd_read_bytes=%" PRIu64 " serialize_ms=%.3f "
+                           "cpu_user_s=%.3f cpu_sys_s=%.3f cpu_reactor_s=%.3f cpu_storage_s=%.3f "
+                           "dma_readbuf_mb=%.1f dma_blob_mb=%.1f heap_peak_delta_mb=%.1f "
+                           "storage_mem_total_mb=%.1f\n",
+                           mctx->run_id,
+                           off->m_jpeg_q,
+                           off->m_jpeg_q < 0 ? "-" : (off->m_chroma_444 ? "444" : "420"),
+                           off->m_darknet ? "darknet" : "sws",
+                           off->m_sample_rate, off->m_frames, off->m_sampled,
+                           off->m_decode_s, off->m_letterbox_s, off->m_encode_s,
+                           off->m_pre_total_s, off->result_size,
+                           off->m_sampled ? (double)off->m_payload_bytes / off->m_sampled : 0.0,
+                           dma_readbuf_mb,
+                           (double)off->m_payload_bytes / (1024.0 * 1024.0),
+                           dma_blob_mb,
+                           (double)off->m_peak_bytes / (1024.0 * 1024.0),
+                           vmhwm_kb >= 0 ? (double)vmhwm_kb / 1024.0 : -1.0,
+                           mctx->ssd_read_ms, mctx->ssd_read_bytes, off->m_serialize_ms,
+                           d_user, d_sys, d_reactor, cpu_storage,
+                           dma_readbuf_mb, dma_blob_mb, heap_peak_delta_mb,
+                           storage_mem_total_mb);
+        }
     } else {
         /* Worker reported failure */
         if (off->result_buf) {
@@ -1708,7 +1976,16 @@ ndp_preprocess_worker(void *arg)
     SPDK_NOTICELOG("[NDP-verify] decoded_frames=%d  sampled_count=%d  "
                    "max_samples=%d\n", frame_idx, sampled_count, max_samples);
 
-    /* Assemble output buffer */
+    /*
+     * Assemble output buffer. This runs after the preprocess timer has
+     * stopped, so it is invisible to "preprocess total" even though it
+     * allocates the whole result blob and copies every payload into it -
+     * hundreds of MB in the q100 condition. Timed separately as
+     * serialize_ms.
+     */
+    struct timespec serialize_start, serialize_end;
+    clock_gettime(CLOCK_MONOTONIC, &serialize_start);
+
     size_t header_bytes     = (1 + sampled_count) * sizeof(uint32_t);
     size_t total_jpeg_bytes = 0;
     for (int i = 0; i < sampled_count; i++) total_jpeg_bytes += jpeg_sizes[i];
@@ -1732,7 +2009,9 @@ ndp_preprocess_worker(void *arg)
         memcpy(dst, jpeg_frames[i], jpeg_sizes[i]);
         dst += jpeg_sizes[i];
     }
- 
+
+    clock_gettime(CLOCK_MONOTONIC, &serialize_end);
+
     /* Output results into offload ctx for the SPDK-thread completion handler */
     off->result_buf    = out_buf;
     off->result_size   = (uint32_t)out_buf_size;
@@ -1759,42 +2038,32 @@ ndp_preprocess_worker(void *arg)
         size_t live = (size_t)ctx->total_video_size + mem_frames_cur + out_buf_size;
         if (live > mem_peak) mem_peak = live;
     }
-    long vmhwm_kb = -1;
-    {
-        FILE *sf = fopen("/proc/self/status", "r");
-        if (sf) {
-            char line[256];
-            while (fgets(line, sizeof(line), sf)) {
-                if (sscanf(line, "VmHWM: %ld kB", &vmhwm_kb) == 1) break;
-            }
-            fclose(sf);
-        }
-    }
 
     SPDK_NOTICELOG("[NDP-timing] decode_video:          %.3f sec\n", t_decode_total);
     SPDK_NOTICELOG("[NDP-timing] letterbox_rgb:         %.3f sec\n", t_letterbox_total);
     SPDK_NOTICELOG("[NDP-timing] encode_jpeg:           %.3f sec\n", t_encode_total);
     SPDK_NOTICELOG("[NDP-timing] preprocess total:      %.3f sec\n", t_preprocess_total);
 
-    SPDK_NOTICELOG("[NDP-MEASURE] q=%d chroma=%s resize=%s sample_rate=%d "
-                   "frames=%d sampled=%d decode=%.3f letterbox=%.3f "
-                   "encode=%.3f pre_total=%.3f bytes=%zu frame_avg=%.1f "
-                   "readbuf_mb=%.1f payload_mb=%.1f blob_mb=%.1f peak_mb=%.1f "
-                   "vmhwm_mb=%.1f\n",
-                   raw_rgb ? -1 : jpeg_quality,
-                   raw_rgb ? "-" : (chroma_444 ? "444" : "420"),
-                   darknet_kernel ? "darknet" : "sws",
-                   sample_rate, frame_idx, sampled_count,
-                   t_decode_total, t_letterbox_total, t_encode_total,
-                   t_preprocess_total, out_buf_size,
-                   sampled_count ? (double)mem_frames_cur / sampled_count : 0.0,
-                   (double)ctx->total_video_size / (1024.0 * 1024.0),
-                   (double)mem_frames_cur / (1024.0 * 1024.0),
-                   (double)out_buf_size / (1024.0 * 1024.0),
-                   (double)mem_peak / (1024.0 * 1024.0),
-                   vmhwm_kb >= 0 ? (double)vmhwm_kb / 1024.0 : -1.0);
+    /*
+     * Park the worker's numbers for the completion handler. [NDP-MEASURE] is
+     * emitted there rather than here because the storage CPU figure can only
+     * be closed out on the reactor, after this thread and libavcodec's frame
+     * threads have exited and their CPU time has landed in RUSAGE_SELF.
+     */
+    off->m_jpeg_q       = raw_rgb ? -1 : jpeg_quality;
+    off->m_chroma_444   = chroma_444;
+    off->m_darknet      = darknet_kernel;
+    off->m_sample_rate  = sample_rate;
+    off->m_frames       = frame_idx;
+    off->m_sampled      = sampled_count;
+    off->m_decode_s     = t_decode_total;
+    off->m_letterbox_s  = t_letterbox_total;
+    off->m_encode_s     = t_encode_total;
+    off->m_pre_total_s  = t_preprocess_total;
+    off->m_serialize_ms = ndp_ms_between(&serialize_start, &serialize_end);
+    off->m_payload_bytes = mem_frames_cur;
+    off->m_peak_bytes    = mem_peak;
 
- 
 release:
     if (jpeg_frames) {
         for (int i = 0; i < sampled_count; i++) {
@@ -1848,7 +2117,21 @@ preprocess_video_yolo(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
     }
     /* This is the last bdev_io: free it now, data is in ctx->read_buf */
     spdk_bdev_free_io(bdev_io);
- 
+
+    /*
+     * All extents are in. This closes the SSD read window: wall time from
+     * just before the first spdk_bdev_read_blocks() submission to here, and
+     * the total bytes pulled off the device. This is the stage the old July
+     * variant logged as "Pure Storage Bdev Read Time" and which the current
+     * preprocess timer excludes entirely.
+     */
+    {
+        struct timespec ssd_end;
+        clock_gettime(CLOCK_MONOTONIC, &ssd_end);
+        ctx->ssd_read_ms    = ndp_ms_between(&ctx->ssd_read_start, &ssd_end);
+        ctx->ssd_read_bytes = ctx->total_video_size;
+    }
+
     if (g_ndp_state != 0) {
         SPDK_ERRLOG("[CUST] NDP busy (state=%d)\n", g_ndp_state);
         rsp->status.sct = SPDK_NVME_SCT_GENERIC;
@@ -1941,6 +2224,19 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
 	SPDK_NOTICELOG("bdev_num_blocks : %lu block_size : %u \n", bdev_num_blocks, block_size);
     SPDK_NOTICELOG("[CUST] Entered custom preprocess (OPC=0x%02x)\n", cmd->opc);
 
+    /*
+     * Measurement baselines, taken on the reactor thread before any work is
+     * submitted. The peak-RSS reset has to happen here so that the VmHWM read
+     * at completion describes only this request's ordinary-heap growth
+     * (libavcodec, libjpeg, the per-frame payloads); the DMA buffers live in
+     * hugepages and are accounted separately.
+     */
+    bool   m_peak_reset_ok = ndp_reset_peak_rss();
+    long   m_rss_entry_kb  = ndp_proc_status_kb("VmRSS:");
+    double m_cpu_user0 = 0.0, m_cpu_sys0 = 0.0;
+    ndp_read_proc_cpu(&m_cpu_user0, &m_cpu_sys0);
+    double m_cpu_reactor0 = ndp_read_thread_cpu();
+
     if (!req->iov || req->iovcnt <= 0) {
         SPDK_ERRLOG("[CUST] No IOV payload\n");
         return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
@@ -1988,7 +2284,23 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
     ctx->jpeg_quality   = cmd->cdw12 & 0xFFu;
     ctx->chroma_444     = (cmd->cdw12 >> 8) & 0x1u;
     ctx->darknet_kernel = (cmd->cdw12 >> 9) & 0x1u;
- 
+
+    /*
+     * cdw13 is unused by 0xC0, so the host passes an opaque run identifier
+     * there and the target echoes it into [NDP-MEASURE]. That lets the host
+     * pair each target log line with its own per-run record.
+     */
+    ctx->run_id = cmd->cdw13;
+
+    /* Carry the entry baselines captured above into the request context. */
+    ctx->peak_rss_reset_ok = m_peak_reset_ok;
+    ctx->rss_entry_kb      = m_rss_entry_kb;
+    ctx->cpu_user_start    = m_cpu_user0;
+    ctx->cpu_sys_start     = m_cpu_sys0;
+    ctx->cpu_reactor_start = m_cpu_reactor0;
+    ctx->ssd_read_ms       = -1.0;
+    ctx->ssd_read_bytes    = 0;
+
     SPDK_NOTICELOG("[CUST] sample_rate=1/%u  jpeg_q=%s  chroma=%s  resize=%s  "
                     "(cdw11=0x%08x cdw12=0x%08x)\n",
                     ctx->sample_rate,
@@ -2000,6 +2312,9 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
 
 
 	uint64_t current_buffer_offset = 0;
+
+	/* Start of the SSD read window; closed in the last extent's callback. */
+	clock_gettime(CLOCK_MONOTONIC, &ctx->ssd_read_start);
 
 	for (uint32_t i = 0; i < extents_count; i++) {
 		ctx->read_start_lba = 8 * lba[i];
