@@ -128,9 +128,14 @@ if do_step psnr; then
       stream=codec_name,width,height,bit_rate,nb_read_frames \
       -of csv=p=0 "$f" | tr ',' ' ')"
     SZ=$(stat -c %s "$f")
-    PSNR=$(ffmpeg -hide_banner -nostats $DEC $CUT -i "$SRC" -i "$f" \
-      -lavfi "[0:v]scale=${W}:${H}:flags=lanczos,format=yuv420p[ref];[1:v]format=yuv420p[dis];[dis][ref]psnr" \
-      -f null - 2>&1 | grep -oP 'average:\K[0-9.]+' | tail -1)
+    # Both chains get settb=AVTB,setpts=N/TB so the psnr filter's framesync
+    # pairs frames by INDEX, not by timestamp. Without this, the input -ss on
+    # the reference leaves the two streams a sub-frame apart in PTS and every
+    # frame after the first is compared against the wrong one - which reads
+    # as a plausible-looking but meaningless ~22 dB instead of ~44 dB.
+    PSNR=$(ffmpeg -hide_banner -nostats $DEC $CUT -i "$SRC" -t "$DUR" -i "$f" \
+      -lavfi "[0:v]scale=${W}:${H}:flags=lanczos,format=yuv420p,settb=AVTB,setpts=N/TB[ref];[1:v]format=yuv420p,settb=AVTB,setpts=N/TB[dis];[dis][ref]psnr" \
+      -f null - 2>&1 | grep -oP 'PSNR y:\K[0-9.]+' | tail -1)
     printf "%-20s %-6s %-10s %-8s %-12s %-12s %s\n" \
            "$(basename "$f")" "$CN" "${W}x${H}" "$NF" "$BR" "$SZ" "${PSNR:-n/a}"
   done
