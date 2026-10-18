@@ -414,6 +414,47 @@ Baseline 세부 타이머:
 
 ---
 
+## 4-4. target 수집 경로 확인 — **ALL OK** (2026-10-19 06:2x)
+
+사용자 PC의 ssh 설정에서 target이 `target-server3` = **<target-lan-ip>:<ssh-port>**, 계정 `kimkitae` 임을 확인했다. supercxl(<host-lan-ip>)이 같은 LAN이라 bastion 없이 직접 닿는다.
+
+조치:
+- `~/.ssh/config` 에 `Host target-server3 oslab-server3` → `<target-lan-ip>:<ssh-port>` (`oslab-server3` 는 9월 스크립트가 쓰던 이름 — target의 실제 호스트명도 `oslab-server3` 다). `/etc/hosts` 수정 불필요, sudo 불필요.
+- 이 host 전용 키 `~/.ssh/id_ed25519_ndp` 생성(무인 실행용, passphrase 없음), 사용자가 `ssh-copy-id` 로 target에 설치.
+- target 호스트 키 고정: `SHA256:heL7+DuNrrLIQnBkP/AQ8oWKckY61LtiZjGwU5RLGsw` (ED25519, `[<target-lan-ip>]:<ssh-port>`).
+- target의 실제 경로로 기본값 교체: RPC `~/near_data_processing_for_video/spdk/scripts/rpc.py`(소켓 `/var/tmp/spdk.sock` 이 `srw-rw-rw-` 라 sudo 불필요), 로그 `~/nvmf_tgt_iotest.log`(nvmf_tgt stdout을 `tee` 한 파일). 9월 스크립트의 `/root/spdk`, `/var/log/spdk_tgt.log` 는 둘 다 맞지 않았다.
+
+`./check_target.sh` 결과: 이름 해석 → <ssh-port> 포트 → 키 로그인 → `bdev_get_iostat`(bdev `nvme1n1`) → 로그 읽기 → **`[NDP-MEASURE]` 가 `run_id` 를 echo** — 전부 OK.
+
+### 스모크 실행의 소급 짝짓기 — 성공
+
+스모크의 NDP 실행 3건 run_id가 target 로그에 모두 있다:
+
+| run_id | 조건 | host `target_pre` (0xC0 왕복) | target `pre_total` | 차이 = NVMe-oF 명령 오버헤드 |
+|---|---|---|---|---|
+| 575380003 | res1080_h264 q85 sr5 | 9.374 | 9.133 | 0.241 s |
+| 575380004 | MOT17-04 raw sr1 | 4.293 | 3.901 | 0.392 s |
+| 575380005 | res1080_av1 q85 sr1 | 49.540 | 49.272 | 0.268 s |
+
+→ 명세 01 H3-2의 "host가 잰 `target_pre` 에는 명령 왕복이 섞여 있다"가 실측으로 0.24~0.39 s 임이 확인됐다. 이제 매 실행마다 두 값이 같은 행에 들어간다.
+
+(스모크 행의 target iostat 차분은 소급할 수 없다 — 실행 전후 스냅샷이 없었다. 본측정부터 채워진다.)
+
+### 본측정 전에 반드시 해결할 것 — target 쪽 2건
+
+1. **지금 target에서 도는 것은 측정용 빌드가 아니다.** 프로세스가 `.../spdk/build/bin/nvmf_tgt_iotrace` (05:49 기동)이고 `NDP_IO_TRACE=1` 빌드다. **§9 스모크는 이 빌드를 상대로 돌았다.** 따라서 스모크의 NDP `target_pre` 값은 I/O 추적 오버헤드를 포함할 수 있어 측정값으로 쓰면 안 된다(다만 MOT17-04 raw의 target_pre 4.293 s가 9월 4.33~4.40 s와 비슷해 오버헤드는 작아 보인다 — **추정**). 본측정 전에 측정용 빌드로 재기동해야 하고, 그 빌드의 stdout을 어느 파일로 `tee` 하는지 알려주면 `TARGET_LOG` 를 맞춘다.
+2. **target의 단계별 분해가 `pre_total` 과 맞지 않는다.**
+
+   | run_id | decode | letterbox | encode | 합 | pre_total | 분해 안 된 몫 |
+   |---|---|---|---|---|---|---|
+   | 575380003 (H.264 q85) | **0.011** | 3.382 | 0.962 | 4.355 | 9.133 | 4.778 s (**52%**) |
+   | 575380004 (raw) | 0.002 | 3.791 | 0.000 | 3.793 | 3.901 | 0.108 s (3%) |
+   | 575380005 (AV1 q85) | 3.193 | 18.181 | 5.097 | 26.471 | 49.272 | 22.801 s (**46%**) |
+
+   H.264 1080p 3597프레임의 `decode=0.011 s` 는 프레임당 3 µs로 물리적으로 불가능하다. decode 타이머가 실제 디코딩을 잡지 못하고 있다(예: 비동기 `avcodec_send_packet` 만 재고 `avcodec_receive_frame` 을 빠뜨렸거나, 디코딩이 다른 스레드에서 돈다 — **추정**). JPEG 모드에서 `pre_total` 의 절반가량이 어느 단계에도 속하지 않는다. **논문에 target 측 "디코딩 X% / 리사이즈 Y% / JPEG Z%" 분해를 쓸 계획이라면 target 계측을 먼저 고쳐야 한다.** `pre_total` 자체는 host의 `target_pre` 와 0.24~0.39 s 차이로 정합하므로 총량은 믿을 수 있다.
+
+---
+
 ## 5. §9 사전 검증 (NVMe-oF 없이 가능한 부분)
 
 target과 NVMe-oF가 필요한 4개 스모크 실행은 아직 못 했지만, **Baseline 경로와 덤프·CSV 조립은 로컬 영상으로 검증했다.**

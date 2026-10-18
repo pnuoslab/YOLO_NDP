@@ -36,9 +36,11 @@ RESULTS=${RESULTS:-$HOME/ndp_results}
 REPEATS=${REPEATS:-3}
 SLEEP_BETWEEN=${SLEEP_BETWEEN:-3}
 
-TARGET_HOST=${TARGET_HOST:-}
-TARGET_LOG=${TARGET_LOG:-/var/log/spdk_tgt.log}
-TARGET_RPC=${TARGET_RPC:-/root/spdk/scripts/rpc.py}
+TARGET_HOST=${TARGET_HOST:-target-server3}   # ~/.ssh/config alias, <target-lan-ip>:<ssh-port>
+# nvmf_tgt writes to stdout, which the target operator tees to a file in
+# ~kimkitae. Point this at whatever the running build is tee'd to.
+TARGET_LOG=${TARGET_LOG:-/home/${SUDO_USER:-$USER}/nvmf_tgt_iotest.log}
+TARGET_RPC=${TARGET_RPC:-/home/${SUDO_USER:-$USER}/near_data_processing_for_video/spdk/scripts/rpc.py}
 TARGET_BDEV=${TARGET_BDEV:-}
 
 # MOT sequences, as <tag>:<video>:<labels>
@@ -141,7 +143,7 @@ ENVTXT="$RESULTS/env.txt"
     echo "── target ($TARGET_HOST) ──"
     tssh \
       "uname -r; $TARGET_RPC spdk_get_version 2>/dev/null | head -20; \
-       git -C /root/spdk log -1 --format='%H %ci %s' 2>/dev/null" 2>&1
+       git -C /home/${SUDO_USER:-$USER}/near_data_processing_for_video/spdk log -1 --format='%H %ci %s' 2>/dev/null" 2>&1
   else
     echo "── target: TARGET_HOST not set, target columns will be empty ──"
   fi

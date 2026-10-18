@@ -24,8 +24,8 @@ set -u
 NVME_DEV=${NVME_DEV:-/dev/nvme1n1}
 NVME_MNT=${NVME_MNT:-/mnt/ext4}
 BLOCK_DEV=${BLOCK_DEV:-nvme1n1}
-TARGET_HOST=${TARGET_HOST:-}
-TARGET_RPC=${TARGET_RPC:-/root/spdk/scripts/rpc.py}
+TARGET_HOST=${TARGET_HOST:-target-server3}   # ~/.ssh/config alias, <target-lan-ip>:<ssh-port>
+TARGET_RPC=${TARGET_RPC:-/home/${SUDO_USER:-$USER}/near_data_processing_for_video/spdk/scripts/rpc.py}
 SIZE_MB=${SIZE_MB:-512}
 OUT=${OUT:-$HOME/ndp_results/pathcheck}
 TESTFILE="$NVME_MNT/iotest.bin"

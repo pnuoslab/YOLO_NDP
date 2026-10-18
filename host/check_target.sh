@@ -15,9 +15,11 @@
 # ══════════════════════════════════════════════════════════════════════
 set -u
 
-TARGET_HOST=${TARGET_HOST:-}
-TARGET_RPC=${TARGET_RPC:-/root/spdk/scripts/rpc.py}
-TARGET_LOG=${TARGET_LOG:-/var/log/spdk_tgt.log}
+TARGET_HOST=${TARGET_HOST:-target-server3}   # ~/.ssh/config alias, <target-lan-ip>:<ssh-port>
+TARGET_RPC=${TARGET_RPC:-/home/${SUDO_USER:-$USER}/near_data_processing_for_video/spdk/scripts/rpc.py}
+# nvmf_tgt writes to stdout, which the target operator tees to a file in
+# ~kimkitae. Point this at whatever the running build is tee'd to.
+TARGET_LOG=${TARGET_LOG:-/home/${SUDO_USER:-$USER}/nvmf_tgt_iotest.log}
 # run_ids the smoke test sent in cdw13; finding them proves pairing works.
 SMOKE_IDS=${SMOKE_IDS:-"575380003 575380004 575380005"}
 
@@ -29,19 +31,27 @@ FAILED=0
 S=(ssh -o BatchMode=yes -o ConnectTimeout=5 "$TARGET_HOST")
 
 echo "1. name resolution"
-if addr=$(getent hosts "$TARGET_HOST" | awk '{print $1; exit}'); [ -n "$addr" ]; then
-  ok "$TARGET_HOST -> $addr"
-elif [[ "$TARGET_HOST" =~ ^[0-9.]+$ ]]; then
-  addr=$TARGET_HOST; ok "literal IP $addr"
+# ssh -G applies ~/.ssh/config, so an alias such as target-server3 resolves
+# to its real HostName and Port even with no /etc/hosts entry.
+cfg_host=$(ssh -G "$TARGET_HOST" 2>/dev/null | awk '$1=="hostname"{print $2}')
+port=$(ssh -G "$TARGET_HOST" 2>/dev/null | awk '$1=="port"{print $2}')
+port=${port:-22}
+if [[ "$cfg_host" =~ ^[0-9.]+$ ]]; then
+  addr=$cfg_host
 else
-  bad "$TARGET_HOST does not resolve (no /etc/hosts entry, no DNS)"; exit 1
+  addr=$(getent hosts "$cfg_host" | awk '{print $1; exit}')
+fi
+if [ -n "$addr" ]; then
+  ok "$TARGET_HOST -> $addr:$port"
+else
+  bad "$TARGET_HOST does not resolve (no ssh config alias, /etc/hosts entry or DNS)"; exit 1
 fi
 
 echo "2. sshd reachable"
-if timeout 4 bash -c "cat </dev/null >/dev/tcp/$addr/22" 2>/dev/null; then
-  ok "port 22 open on $addr"
+if timeout 4 bash -c "cat </dev/null >/dev/tcp/$addr/$port" 2>/dev/null; then
+  ok "port $port open on $addr"
 else
-  bad "port 22 refused/unreachable on $addr"; exit 1
+  bad "port $port refused/unreachable on $addr"; exit 1
 fi
 
 echo "3. key-based login (BatchMode, no password prompt)"
