@@ -112,6 +112,41 @@ tssh() {
   fi
 }
 
+# ── target build guard ────────────────────────────────────────────────
+# The target ships several nvmf_tgt variants side by side, and the tracing
+# one (nvmf_tgt_iotrace, NDP_IO_TRACE=1) adds per-I/O bookkeeping to the
+# very preprocessing path being timed. It was left running once already
+# after a restart was believed to have happened, so the check is
+# mechanical: whatever binary is actually running is looked up and an
+# iotrace build stops the script. ALLOW_IOTRACE=1 overrides, for the
+# section 6 path check only.
+ALLOW_IOTRACE=${ALLOW_IOTRACE:-0}
+TARGET_BIN=""
+if [ -n "$TARGET_HOST" ]; then
+  TARGET_BIN=$(tssh "pgrep -a -f 'build/bin/nvmf_tgt' | grep -v -e sudo -e pgrep | awk '{print \$2}' | head -1" 2>/dev/null || true)
+  if [ -z "$TARGET_BIN" ]; then
+    echo "[ERR] no nvmf_tgt process found on $TARGET_HOST"; exit 1
+  fi
+  echo "[target] running: $TARGET_BIN"
+  case "$TARGET_BIN" in
+    *iotrace*)
+      if [ "$ALLOW_IOTRACE" != 1 ]; then
+        echo "[ERR] the target is running the I/O-tracing build ($TARGET_BIN)."
+        echo "      Restart it with the measurement build (nvmf_tgt_measure or"
+        echo "      nvmf_tgt) before measuring; ALLOW_IOTRACE=1 overrides."
+        exit 1
+      fi
+      echo "[WARN] ALLOW_IOTRACE=1: measuring against a tracing build" ;;
+  esac
+  TARGET_BIN_SHA=$(tssh "sha256sum '$TARGET_BIN' | cut -d' ' -f1" 2>/dev/null || true)
+  if ! tssh "test -r '$TARGET_LOG'" 2>/dev/null; then
+    echo "[ERR] TARGET_LOG=$TARGET_LOG is not readable on $TARGET_HOST;"
+    echo "      [NDP-MEASURE] lines could not be paired. Set TARGET_LOG to the"
+    echo "      file the running nvmf_tgt is tee'd to."
+    exit 1
+  fi
+fi
+
 # ── environment record ────────────────────────────────────────────────
 ENVTXT="$RESULTS/env.txt"
 {
@@ -141,6 +176,8 @@ ENVTXT="$RESULTS/env.txt"
   echo
   if [ -n "$TARGET_HOST" ]; then
     echo "── target ($TARGET_HOST) ──"
+    echo "binary: $TARGET_BIN  sha256=${TARGET_BIN_SHA:-?}"
+    echo "log:    $TARGET_LOG"
     tssh \
       "uname -r; $TARGET_RPC spdk_get_version 2>/dev/null | head -20; \
        git -C /home/${SUDO_USER:-$USER}/near_data_processing_for_video/spdk log -1 --format='%H %ci %s' 2>/dev/null" 2>&1
