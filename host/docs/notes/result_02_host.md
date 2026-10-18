@@ -463,17 +463,44 @@ sudo -E TARGET_HOST=oslab-server3 ./run_pathcheck.sh
 
 측정용 입력은 건드리지 않고 `iotest.bin` 하나만 쓰고 지운다.
 
-### 7-1. target 기동
+### 7-1. target 기동 — **현재 `nvmf_tgt` 가 떠 있지 않다 (확인된 문제)**
+
+`nvme connect` 가 실패하는 이유는 입력 오류가 아니다. target에 SPDK가 안 떠 있다:
+
+```
+$ ping -c2 192.168.100.2        → 0% loss, 0.2 ms      (머신과 링크는 정상)
+$ /dev/tcp/192.168.100.2/4420   → Connection refused   (nvmf_tgt 미동작)
+$ nvme list-subsys              → 로컬 PCIe SSD 하나뿐, nvme1n1 없음
+$ ls -ld /mnt/ext4              → No such file or directory
+```
+
+링크는 살아 있으니 target에서 `nvmf_tgt` → `conf_subsystem.sh` 만 실행하면 된다.
+
+
 1. target에서 `nvmf_tgt` 를 **`NDP_IO_TRACE=1` 빌드로** 기동 (§6용) → `conf_subsystem.sh`
 2. §6이 끝나면 **측정용 `NDP_IO_TRACE=0` 빌드로 재기동** (§9용)
 3. target이 `run_id`(cdw13)를 `[NDP-MEASURE]` 줄에 echo 하도록 target 명세 §3-5가 반영돼 있어야 한다
 
 ### 7-2. host 볼륨 준비 (사용자 직접)
+
+사용자가 쓰는 정확한 순서 (**`mkdir` 이 필요하다** — 앞선 판에서 빠져 있었다):
+
 ```bash
 sudo nvme connect -t tcp -n nqn.2016-06.io.spdk:cnode1 -a 192.168.100.2 -s 4420
 sudo mkfs.ext4 /dev/nvme1n1        # 볼륨 전체를 지움 — 직접 실행해 주세요
+sudo mkdir /mnt/ext4
 sudo mount /dev/nvme1n1 /mnt/ext4
 ```
+
+측정 종료 시:
+
+```bash
+sudo umount /dev/nvme1n1
+sudo nvme disconnect -n nqn.2016-06.io.spdk:cnode1
+sudo rm -rf /mnt/ext4
+```
+
+`mkfs.ext4` 는 매번 볼륨을 비우므로 그 뒤에 §7-3의 입력 복사를 다시 해야 한다.
 
 ### 7-3. 입력 복사
 ```bash
@@ -488,8 +515,26 @@ sync
 ```
 합계 약 1.1 GB. **이번에는 복사 후 매 실행 직전에 `drop_caches` 를 하므로**, 9월처럼 Baseline이 page cache에서 읽는 문제는 생기지 않는다.
 
-### 7-4. ssh 접근
-`run_measure.sh` 가 쓰던 방식 그대로 `TARGET_HOST=oslab-server3` 로 비밀번호 없이 접속돼야 한다. `run_all.sh` 는 여기에 추가로 **`rpc.py bdev_get_iostat` 호출 권한**이 필요하다 (`TARGET_RPC` 기본값 `/root/spdk/scripts/rpc.py`). 경로가 다르면 알려주세요.
+### 7-4. ssh 접근 — **현재 끊겨 있다 (확인된 문제)**
+
+`run_measure.sh` 가 쓰던 `TARGET_HOST=oslab-server3` 가 **이 host에서 더 이상 이름 해석되지 않는다**:
+
+```
+$ ssh oslab-server3
+ssh: Could not resolve hostname oslab-server3: Temporary failure in name resolution
+
+$ grep oslab /etc/hosts        → 없음
+$ ls ~/.ssh/config             → 파일 없음
+
+$ ssh 192.168.100.2
+ssh: connect to host 192.168.100.2 port 22: Connection refused
+```
+
+즉 storage 링크(192.168.100.2)에는 sshd가 없고, `oslab-server3` 라는 이름을 풀 방법도 남아 있지 않다. 9월에는 동작했으므로 DNS 또는 root 계정의 ssh 설정이 바뀐 것으로 보인다(**추정** — `/root/.ssh` 는 읽을 수 없다. 9월 실행이 `sudo -E ./run_measure.sh` 였으므로 ssh는 root로 나갔다).
+
+**영향**: ssh가 없으면 `run_all.sh` 의 target 관련 열(`tgt_bytes_read` 등 iostat 차분, target `[NDP-MEASURE]`)이 전부 비고, §6-7 대조도 못 한다. 스크립트는 ssh 실패를 무시하고 진행하도록 돼 있어 측정 자체는 멈추지 않지만, **"NDP의 0xC0이 SSD에서 파일 크기만큼 읽었는가"를 확인할 수 없게 된다** — 명세 §9의 확인 항목 중 하나다.
+
+**필요한 것**: target의 관리용 IP 또는 호스트명과, 거기로 비밀번호 없이 ssh가 되는 설정(`/etc/hosts` 항목 또는 `~/.ssh/config`). 추가로 `rpc.py bdev_get_iostat` 호출 권한이 필요하다(`TARGET_RPC` 기본값 `/root/spdk/scripts/rpc.py`; 경로가 다르면 알려주세요).
 
 ---
 
