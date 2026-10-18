@@ -7,7 +7,16 @@
 # Usage:  bash target_probe.sh [seconds]      (default 10)
 
 SECS="${1:-10}"
-PID=$(pgrep -f '[n]vmf_tgt' | head -1)
+# SPDK renames its main thread to reactor_0, so pgrep by name misses it; and
+# matching the cmdline also catches the "sudo ..." wrapper. Take the deepest
+# match that is NOT sudo.
+PID=$(for p in /proc/[0-9]*; do
+          c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+          case "$c" in
+              sudo*) ;;
+              */build/bin/nvmf_tgt*) echo "${p##*/}" ;;
+          esac
+      done | tail -1)
 
 if [ -z "$PID" ]; then
     echo "ERROR: nvmf_tgt is not running. Start it first, then re-run this script."
@@ -26,9 +35,9 @@ echo "=== threads and their CPU over ${SECS}s ==="
 declare -A T0
 for t in /proc/$PID/task/*; do
     tid=${t##*/}
-    read -r _ _ rest < <(sed 's/.*) //' $t/stat 2>/dev/null)
+    rest=$(sed 's/.*) //' $t/stat 2>/dev/null)
     set -- $rest
-    # after "comm) ", field 12 = utime, 13 = stime (state is field 1)
+    # after stripping through "comm) ": $1=state ... $12=utime, $13=stime
     T0[$tid]=$(( ${12:-0} + ${13:-0} ))
 done
 
@@ -40,7 +49,7 @@ for t in /proc/$PID/task/*; do
     tid=${t##*/}
     [ -r "$t/stat" ] || continue
     name=$(cat $t/comm 2>/dev/null)
-    read -r _ _ rest < <(sed 's/.*) //' $t/stat 2>/dev/null)
+    rest=$(sed 's/.*) //' $t/stat 2>/dev/null)
     set -- $rest
     now=$(( ${12:-0} + ${13:-0} ))
     d=$(( now - ${T0[$tid]:-$now} ))
