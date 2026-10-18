@@ -1160,6 +1160,8 @@ uint32_t g_total_buffer_size = 0;
 uint16_t g_video_width = 0;
 uint16_t g_video_height = 0;
 
+#define NDP_JPEG_Q_RAW  101
+
 struct ndp_request_ctx {
     uint64_t read_num_blocks, read_start_lba;
     struct spdk_nvmf_request *req;
@@ -1170,6 +1172,8 @@ struct ndp_request_ctx {
     /* Parameters carried by the 0xC0 command */
     uint32_t sample_rate;      /* cdw11[15:0], 0 falls back to 1  */
     uint32_t jpeg_quality;     /* cdw12[7:0],  0 falls back to 85 */
+    uint32_t chroma_444;       /* cdw12[8],    0 = 4:2:0 (default) */
+    uint32_t darknet_kernel;   /* cdw12[9],    1 = darknet-compatible resize */
 };
 
 struct buffer_data {
@@ -1219,6 +1223,72 @@ static struct SwsContext *g_sws_ctx  = NULL;
 static int g_sws_src_w = 0, g_sws_src_h = 0;
 static int g_sws_dst_w = 0, g_sws_dst_h = 0;
 static enum AVPixelFormat g_sws_fmt  = AV_PIX_FMT_NONE;
+
+/*
+ * Darknet's resize_image() (image.c) reimplemented on interleaved uint8 RGB.
+ *
+ * Two separable 2-tap passes, corner-aligned, scale = (n-1)/(m-1), and no
+ * prefiltering whatsoever. swscale's SWS_BILINEAR widens its filter support as
+ * the downscale ratio grows and therefore low-passes the source; darknet's
+ * does not. At 1920 -> 416 the two produce visibly different images, and since
+ * YOLOv7-tiny was trained and validated through darknet's kernel, feeding it
+ * the swscale output is a train/test domain shift rather than a neutral
+ * implementation choice. Reproducing the host kernel here is what makes the
+ * offloaded pipeline numerically comparable to the host baseline.
+ */
+static uint8_t *ndp_resize_darknet_rgb(const uint8_t *src, int sw, int sh,
+                                       int dw, int dh)
+{
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return NULL;
+
+    float   *part = (float *)malloc((size_t)dw * sh * 3 * sizeof(float));
+    uint8_t *dst  = (uint8_t *)malloc((size_t)dw * dh * 3);
+    if (!part || !dst) { free(part); free(dst); return NULL; }
+
+    const float wsc = (dw > 1) ? (float)(sw - 1) / (float)(dw - 1) : 0.0f;
+    const float hsc = (dh > 1) ? (float)(sh - 1) / (float)(dh - 1) : 0.0f;
+
+    /* Horizontal pass: source rows kept, columns resampled into float. */
+    for (int r = 0; r < sh; ++r) {
+        const uint8_t *srow = src  + (size_t)r * sw * 3;
+        float         *prow = part + (size_t)r * dw * 3;
+        for (int c = 0; c < dw; ++c) {
+            if (c == dw - 1 || sw == 1) {
+                for (int k = 0; k < 3; ++k)
+                    prow[c * 3 + k] = (float)srow[(size_t)(sw - 1) * 3 + k];
+            } else {
+                float sx = (float)c * wsc;
+                int   ix = (int)sx;
+                float dx = sx - (float)ix;
+                if (ix > sw - 2) { ix = sw - 2; dx = 1.0f; }
+                for (int k = 0; k < 3; ++k)
+                    prow[c * 3 + k] =
+                        (1.0f - dx) * (float)srow[(size_t)ix * 3 + k]
+                              + dx  * (float)srow[(size_t)(ix + 1) * 3 + k];
+            }
+        }
+    }
+
+    /* Vertical pass, with rounding back to uint8. */
+    for (int r = 0; r < dh; ++r) {
+        float sy = (float)r * hsc;
+        int   iy = (int)sy;
+        float dy = sy - (float)iy;
+        if (r == dh - 1 || sh == 1) { iy = sh - 1; dy = 0.0f; }
+        if (iy > sh - 2 && dy > 0.0f) { iy = sh - 2; dy = 1.0f; }
+
+        const float *p0   = part + (size_t)iy * dw * 3;
+        const float *p1   = (dy > 0.0f) ? p0 + (size_t)dw * 3 : p0;
+        uint8_t     *drow = dst + (size_t)r * dw * 3;
+        for (int i = 0; i < dw * 3; ++i) {
+            int q = (int)((1.0f - dy) * p0[i] + dy * p1[i] + 0.5f);
+            drow[i] = (uint8_t)(q < 0 ? 0 : (q > 255 ? 255 : q));
+        }
+    }
+
+    free(part);
+    return dst;
+}
  
 /*
  * Decoded YUV frame -> net_w x net_h letterboxed RGB24, HWC uint8.
@@ -1227,9 +1297,16 @@ static enum AVPixelFormat g_sws_fmt  = AV_PIX_FMT_NONE;
  * host: a float32 CHW tensor is roughly two orders of magnitude larger than
  * the JPEG that carries the same frame, so the split point is chosen where
  * the transferred payload is smallest.
+ *
+ * darknet_kernel selects how the frame is scaled down. 0 lets swscale do the
+ * colour conversion and the downscale in one pass (fewer passes over the
+ * data, but its own resampling filter). 1 restricts swscale to the colour
+ * conversion at source resolution and runs ndp_resize_darknet_rgb() after it,
+ * matching the host baseline at the cost of an extra full-resolution buffer.
  */
 static uint8_t *ndp_frame_to_letterbox_rgb(AVFrame *frame,
                                            int net_w, int net_h,
+                                           int darknet_kernel,
                                            int *out_w, int *out_h,
                                            int *out_scaled_w, int *out_scaled_h)
 {
@@ -1251,26 +1328,38 @@ static uint8_t *ndp_frame_to_letterbox_rgb(AVFrame *frame,
     if (new_w < 1) new_w = 1;
     if (new_h < 1) new_h = 1;
  
+    /* Target of the swscale pass: the final size when swscale also scales,
+     * the source size when the darknet kernel does the scaling instead. */
+    const int cvt_w = darknet_kernel ? sw : new_w;
+    const int cvt_h = darknet_kernel ? sh : new_h;
+ 
     if (!g_sws_ctx || g_sws_src_w != sw || g_sws_src_h != sh ||
-        g_sws_dst_w != new_w || g_sws_dst_h != new_h ||
+        g_sws_dst_w != cvt_w || g_sws_dst_h != cvt_h ||
         g_sws_fmt != frame->format) {
         if (g_sws_ctx) sws_freeContext(g_sws_ctx);
         g_sws_ctx = sws_getContext(sw, sh, frame->format,
-                                   new_w, new_h, AV_PIX_FMT_RGB24,
+                                   cvt_w, cvt_h, AV_PIX_FMT_RGB24,
                                    SWS_BILINEAR, NULL, NULL, NULL);
         g_sws_src_w = sw;    g_sws_src_h = sh;
-        g_sws_dst_w = new_w; g_sws_dst_h = new_h;
+        g_sws_dst_w = cvt_w; g_sws_dst_h = cvt_h;
         g_sws_fmt   = frame->format;
     }
     if (!g_sws_ctx) return NULL;
  
-    uint8_t *scaled = (uint8_t *)malloc((size_t)new_w * new_h * 3);
-    if (!scaled) return NULL;
-    uint8_t *dst[4]    = { scaled, NULL, NULL, NULL };
-    int      dst_ls[4] = { 3 * new_w, 0, 0, 0 };
+    uint8_t *conv = (uint8_t *)malloc((size_t)cvt_w * cvt_h * 3);
+    if (!conv) return NULL;
+    uint8_t *dst[4]    = { conv, NULL, NULL, NULL };
+    int      dst_ls[4] = { 3 * cvt_w, 0, 0, 0 };
     sws_scale(g_sws_ctx,
               (const uint8_t * const *)frame->data, frame->linesize,
               0, sh, dst, dst_ls);
+ 
+    uint8_t *scaled = conv;
+    if (darknet_kernel) {
+        scaled = ndp_resize_darknet_rgb(conv, cvt_w, cvt_h, new_w, new_h);
+        free(conv);
+        if (!scaled) return NULL;
+    }
  
     /* Grey padding, matching darknet's 0.5f fill value */
     uint8_t *lb = (uint8_t *)malloc((size_t)net_w * net_h * 3);
@@ -1295,7 +1384,8 @@ static uint8_t *ndp_frame_to_letterbox_rgb(AVFrame *frame,
 /* HWC uint8 RGB -> in-memory JPEG. Quality is host-controlled via
  * cdw12[15:8]; 0 selects the 85 default. */
 static uint8_t *encode_jpeg_from_rgb(uint8_t *rgb, int w, int h,
-                                     int quality, size_t *out_size)
+                                     int quality, int chroma_444,
+                                     size_t *out_size)
 {
     struct jpeg_compress_struct cinfo;
     struct jpeg_error_mgr       jerr;
@@ -1314,6 +1404,12 @@ static uint8_t *encode_jpeg_from_rgb(uint8_t *rgb, int w, int h,
     cinfo.in_color_space   = JCS_RGB;
     jpeg_set_defaults(&cinfo);
     jpeg_set_quality(&cinfo, quality, TRUE);
+
+    if (chroma_444) {
+        cinfo.comp_info[0].h_samp_factor = 1;
+        cinfo.comp_info[0].v_samp_factor = 1;
+    }
+
     jpeg_start_compress(&cinfo, TRUE);
  
     while (cinfo.next_scanline < cinfo.image_height) {
@@ -1416,6 +1512,14 @@ ndp_preprocess_worker(void *arg)
     double t_preprocess_total = 0.0;
     double t_letterbox_total  = 0.0;
     double t_encode_total     = 0.0;
+    double t_decode_total     = 0.0;
+    struct timespec decode_start, decode_end;
+
+    /* Allocation high-water mark. Process RSS is useless here because SPDK
+     * reserves its hugepages at startup, so the worker tracks the bytes it
+     * actually holds: the video read buffer, the accumulated per-frame
+     * payloads, and the assembled output blob. */
+    size_t mem_frames_cur = 0, mem_peak = 0;
  
     struct buffer_data bd = {
         .ptr        = (uint8_t *)ctx->read_buf,
@@ -1468,7 +1572,10 @@ ndp_preprocess_worker(void *arg)
     if (sample_rate < 1) sample_rate = 1;
  
     int jpeg_quality = (int)ctx->jpeg_quality;
-    if (jpeg_quality < 1 || jpeg_quality > 100) jpeg_quality = 85;
+    int raw_rgb = (jpeg_quality == NDP_JPEG_Q_RAW);
+    if (!raw_rgb && (jpeg_quality < 1 || jpeg_quality > 100)) jpeg_quality = 85;
+    int chroma_444 = (!raw_rgb && ctx->chroma_444) ? 1 : 0;
+    int darknet_kernel = ctx->darknet_kernel ? 1 : 0;
  
     /* Must match the host's expectation of ((total - 1) / rate) + 1, or the
      * host's frame-alignment guard will reject the result. */
@@ -1481,10 +1588,12 @@ ndp_preprocess_worker(void *arg)
         goto release;
     }
  
-    SPDK_NOTICELOG("[NDP-verify] container_nb_frames=%ld  src=%dx%d  "
-                   "sample_rate=1/%d  max_samples=%d  jpeg_q=%d\n",
-                   total_nb_frames, codec_ctx->width, codec_ctx->height,
-                   sample_rate, max_samples, jpeg_quality);
+    SPDK_NOTICELOG("[NDP-verify] ... sample_rate=1/%d  max_samples=%d  "
+                   "jpeg_q=%d  chroma=%s  resize=%s\n",
+                   sample_rate, max_samples,
+                   raw_rgb ? -1 : jpeg_quality,
+                   raw_rgb ? "raw-rgb24" : (chroma_444 ? "4:4:4" : "4:2:0"),
+                   darknet_kernel ? "darknet" : "swscale");
     SPDK_NOTICELOG("[NDP-worker] Start decoding: total_frames=%ld, max_samples=%d\n",
                    total_nb_frames, max_samples);
 
@@ -1511,7 +1620,11 @@ ndp_preprocess_worker(void *arg)
         }
  
         for (;;) {
+            clock_gettime(CLOCK_MONOTONIC, &decode_start);
             int recv_rc = avcodec_receive_frame(codec_ctx, frame);
+            clock_gettime(CLOCK_MONOTONIC, &decode_end);
+            t_decode_total += (decode_end.tv_sec  - decode_start.tv_sec) +
+                              (decode_end.tv_nsec - decode_start.tv_nsec) / 1e9;
             if (recv_rc == AVERROR(EAGAIN) || recv_rc == AVERROR_EOF) break;
             if (recv_rc < 0) {
                 SPDK_ERRLOG("[NDP-worker] receive_frame failed rc=%d\n", recv_rc);
@@ -1535,6 +1648,7 @@ ndp_preprocess_worker(void *arg)
                 int lb_w = 0, lb_h = 0, sc_w = 0, sc_h = 0;
                 clock_gettime(CLOCK_MONOTONIC, &letterbox_start);
                 uint8_t *lb = ndp_frame_to_letterbox_rgb(frame, net_w, net_h,
+                                                         darknet_kernel,
                                                          &lb_w, &lb_h,
                                                          &sc_w, &sc_h);
                 clock_gettime(CLOCK_MONOTONIC, &letterbox_end);
@@ -1553,9 +1667,21 @@ ndp_preprocess_worker(void *arg)
                 }
  
                 size_t jsize = 0;
+                uint8_t *jbuf = NULL;
                 clock_gettime(CLOCK_MONOTONIC, &encode_start);
-                uint8_t *jbuf = encode_jpeg_from_rgb(lb, lb_w, lb_h,
-                                                     jpeg_quality, &jsize);
+                if (raw_rgb) {
+                    /* The letterboxed buffer already has the layout the host
+                     * feeds to the network, so ownership is transferred
+                     * instead of copied. lb is cleared so the free() below
+                     * does not release a buffer that is now in jpeg_frames[]. */
+                    jbuf  = lb;
+                    jsize = (size_t)lb_w * lb_h * 3;
+                    lb    = NULL;
+                } else {
+                    jbuf = encode_jpeg_from_rgb(lb, lb_w, lb_h,
+                                                jpeg_quality, chroma_444,
+                                                &jsize);
+                }
                 clock_gettime(CLOCK_MONOTONIC, &encode_end);
                 t_encode_total += (encode_end.tv_sec  - encode_start.tv_sec) +
                                   (encode_end.tv_nsec - encode_start.tv_nsec) / 1e9;
@@ -1565,6 +1691,8 @@ ndp_preprocess_worker(void *arg)
                     jpeg_frames[sampled_count] = jbuf;
                     jpeg_sizes[sampled_count]  = jsize;
                     sampled_count++;
+                    mem_frames_cur += jsize;
+                    if (mem_frames_cur > mem_peak) mem_peak = mem_frames_cur;
                 } else if (jbuf) {
                     free(jbuf);
                 }
@@ -1616,9 +1744,55 @@ ndp_preprocess_worker(void *arg)
     SPDK_NOTICELOG("[NDP-worker] Done. Sampled=%d/%ld, total=%zu B\n",
                sampled_count, total_nb_frames, out_buf_size);
 
+    /* Peak is measured at the point both the per-frame payloads and the
+     * assembled blob are live, which is the worker's true footprint. This is
+     * a manual accumulation, not an OS measurement: it covers the buffers
+     * this function owns, but not libjpeg's internal work buffers, avcodec's
+     * decoder-internal frame queue, or malloc fragmentation overhead, so
+     * treat it as a lower bound - especially for the JPEG conditions, where
+     * libjpeg's own footprint is unaccounted for. VmHWM below is the OS's
+     * own measurement of this process's peak resident set since it started,
+     * which is a true measurement but is not decomposable by pipeline stage
+     * the way the manual figure is. The two are logged side by side so a gap
+     * between them is visible rather than silently assumed away. */
+    {
+        size_t live = (size_t)ctx->total_video_size + mem_frames_cur + out_buf_size;
+        if (live > mem_peak) mem_peak = live;
+    }
+    long vmhwm_kb = -1;
+    {
+        FILE *sf = fopen("/proc/self/status", "r");
+        if (sf) {
+            char line[256];
+            while (fgets(line, sizeof(line), sf)) {
+                if (sscanf(line, "VmHWM: %ld kB", &vmhwm_kb) == 1) break;
+            }
+            fclose(sf);
+        }
+    }
+
+    SPDK_NOTICELOG("[NDP-timing] decode_video:          %.3f sec\n", t_decode_total);
     SPDK_NOTICELOG("[NDP-timing] letterbox_rgb:         %.3f sec\n", t_letterbox_total);
     SPDK_NOTICELOG("[NDP-timing] encode_jpeg:           %.3f sec\n", t_encode_total);
     SPDK_NOTICELOG("[NDP-timing] preprocess total:      %.3f sec\n", t_preprocess_total);
+
+    SPDK_NOTICELOG("[NDP-MEASURE] q=%d chroma=%s resize=%s sample_rate=%d "
+                   "frames=%d sampled=%d decode=%.3f letterbox=%.3f "
+                   "encode=%.3f pre_total=%.3f bytes=%zu frame_avg=%.1f "
+                   "readbuf_mb=%.1f payload_mb=%.1f blob_mb=%.1f peak_mb=%.1f "
+                   "vmhwm_mb=%.1f\n",
+                   raw_rgb ? -1 : jpeg_quality,
+                   raw_rgb ? "-" : (chroma_444 ? "444" : "420"),
+                   darknet_kernel ? "darknet" : "sws",
+                   sample_rate, frame_idx, sampled_count,
+                   t_decode_total, t_letterbox_total, t_encode_total,
+                   t_preprocess_total, out_buf_size,
+                   sampled_count ? (double)mem_frames_cur / sampled_count : 0.0,
+                   (double)ctx->total_video_size / (1024.0 * 1024.0),
+                   (double)mem_frames_cur / (1024.0 * 1024.0),
+                   (double)out_buf_size / (1024.0 * 1024.0),
+                   (double)mem_peak / (1024.0 * 1024.0),
+                   vmhwm_kb >= 0 ? (double)vmhwm_kb / 1024.0 : -1.0);
 
  
 release:
@@ -1811,13 +1985,18 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
     ctx->sample_rate = cmd->cdw11 & 0xFFFFu;
     if (ctx->sample_rate == 0) ctx->sample_rate = 1;
  
-    ctx->jpeg_quality = cmd->cdw12 & 0xFFu;
+    ctx->jpeg_quality   = cmd->cdw12 & 0xFFu;
+    ctx->chroma_444     = (cmd->cdw12 >> 8) & 0x1u;
+    ctx->darknet_kernel = (cmd->cdw12 >> 9) & 0x1u;
  
-    SPDK_NOTICELOG("[CUST] sample_rate=1/%u  jpeg_q=%u  "
-                   "(cdw11=0x%08x cdw12=0x%08x)\n",
-                   ctx->sample_rate,
-                   ctx->jpeg_quality ? ctx->jpeg_quality : 85,
-                   cmd->cdw11, cmd->cdw12);
+    SPDK_NOTICELOG("[CUST] sample_rate=1/%u  jpeg_q=%s  chroma=%s  resize=%s  "
+                    "(cdw11=0x%08x cdw12=0x%08x)\n",
+                    ctx->sample_rate,
+                    ctx->jpeg_quality == NDP_JPEG_Q_RAW ? "raw" : "(see worker)",
+                    ctx->jpeg_quality == NDP_JPEG_Q_RAW ? "-"
+                        : (ctx->chroma_444 ? "4:4:4" : "4:2:0"),
+                    ctx->darknet_kernel ? "darknet" : "swscale",
+                    cmd->cdw11, cmd->cdw12);
 
 
 	uint64_t current_buffer_offset = 0;
