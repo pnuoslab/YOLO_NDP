@@ -375,6 +375,28 @@ extern "C" image ndp_jpeg_to_image(const unsigned char *buf, size_t len)
     }
 }
 
+/* Letterboxed RGB24 (HWC, uint8) from the target -> darknet image
+ * (CHW, float, [0,1]). This mirrors what mat_to_image() produces for the
+ * JPEG path, minus the decode: the target emits AV_PIX_FMT_RGB24, which is
+ * already the channel order the network expects, so no swap is performed. */
+image ndp_raw_to_image(const unsigned char *buf, size_t len,
+                              int w, int h)
+{
+    image im = {0};
+    if (!buf || len < (size_t)w * h * 3) return im;
+
+    im = make_image(w, h, 3);
+    if (!im.data) return im;
+
+    const size_t plane = (size_t)w * h;
+    for (size_t p = 0; p < plane; ++p) {
+        im.data[p]             = buf[p * 3 + 0] / 255.0f;
+        im.data[plane + p]     = buf[p * 3 + 1] / 255.0f;
+        im.data[2 * plane + p] = buf[p * 3 + 2] / 255.0f;
+    }
+    return im;
+}
+
 // ====================================================================
 // Window
 // ====================================================================

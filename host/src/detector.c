@@ -10,6 +10,8 @@
 #include <linux/fs.h>
 #include <linux/fiemap.h>
 #include <linux/nvme_ioctl.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 
 #include "image.h"
 
@@ -23,6 +25,8 @@
 #include "demo.h"
 #include "option_list.h"
 #include "image_opencv.h"
+
+#define NDP_JPEG_Q_RAW  101
 
 /* OpenCV CAP_PROP_* values. image_opencv.h does not export the enum, and the
  * numeric values are stable across OpenCV 2.x-4.x. */
@@ -50,7 +54,8 @@ typedef struct {
 
 static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out);
 static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
-                         int sample_rate, int jpeg_quality,
+                         int sample_rate, int jpeg_quality, int chroma_444,
+                         int darknet_kernel,
                          uint32_t *total_result_size_out);
 static int ndp_send_0xc2(int nvme_fd, void *buf, uint32_t total_bytes);
 
@@ -1201,13 +1206,23 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
                          int use_ndp, int sample_rate, int label_base,
                          float thresh_calc_avg_iou, const float iou_thresh,
                          const int map_points, int coco_range,
-                         int jpeg_quality,
+                         int jpeg_quality, int chroma_444, int darknet_kernel,
                          char *save_img_dir, char *save_log_path)
 {
     int i, j;
  
     if (!video_path) { fprintf(stderr, "[MAP] -file <video> is required\n"); return 0; }
-    if (!label_dir)  { fprintf(stderr, "[MAP] -labels <dir> is required\n"); return 0; }
+
+    /* Omitting -labels selects a performance-only run: the pipeline is
+     * exercised and the [MEASURE] line is still emitted, but ground-truth
+     * loading and the whole mAP computation are skipped. This is for footage
+     * that has no annotations at all, where only latency, transfer volume
+     * and memory are of interest - it avoids having to fabricate dummy label
+     * files purely to satisfy the scoring path. */
+    const int perf_only = (label_dir == NULL);
+    if (perf_only)
+        fprintf(stderr, "[MAP] no -labels given: performance-only run, "
+                        "mAP will not be computed\n");
     if (sample_rate < 1) sample_rate = 1;
  
     /* ---- network ---- */
@@ -1245,10 +1260,15 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     }
  
     printf("[MAP][VERIFY] video=%s  orig=%dx%d  cap_frame_count=%d  "
-           "sample_rate=1/%d  mode=%s  jpeg_q=%d\n",
+           "sample_rate=1/%d  mode=%s  jpeg_q=%s  chroma=%s  resize=%s\n",
            video_path, orig_w, orig_h, total_frames, sample_rate,
            use_ndp ? "NDP" : "BASELINE",
-           use_ndp ? (jpeg_quality ? jpeg_quality : 85) : -1);
+           !use_ndp ? "-"
+               : (jpeg_quality == NDP_JPEG_Q_RAW ? "raw"
+                  : (jpeg_quality ? "set" : "85(default)")),
+           !use_ndp || jpeg_quality == NDP_JPEG_Q_RAW ? "-"
+               : (chroma_444 ? "4:4:4" : "4:2:0"),
+           !use_ndp ? "-" : (darknet_kernel ? "darknet" : "swscale"));
     {
         /* Letterbox geometry darknet will assume when inverting box
          * coordinates. The target logs the same four numbers as
@@ -1272,6 +1292,19 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     const uint8_t  *blob_base  = NULL;
     uint32_t  num_ndp_frames   = 0;
     size_t    blob_off         = 0;
+
+    /* Latency accounting. The e2e window opens just before the 0xC0 command
+     * and closes after the last inference: model loading and the mAP pass sit
+     * outside it, because neither is part of the pipeline being compared.
+     * t_io is the storage-to-host transfer, t_pre is every pixel operation
+     * (target-side for NDP, host-side for the baseline), t_infer is the
+     * network forward pass. */
+    double t_e2e_start = 0.0, t_e2e = 0.0;
+    double t_c0 = 0.0, t_io = 0.0, t_pre = 0.0, t_infer = 0.0;
+    uint32_t transfer_bytes = 0;
+    uint32_t frame_min = 0xFFFFFFFFu, frame_max = 0;
+    double   frame_avg = 0.0;
+    size_t   host_blob_bytes = 0;
  
     if (use_ndp) {
         nvme_fd = open(nvme_dev, O_RDWR);
@@ -1281,23 +1314,32 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
             release_capture(cap); return 0;
         }
         uint32_t total_result_size = 0;
+        t_e2e_start = what_time_is_it_now();
+        double t0 = what_time_is_it_now();
         if (ndp_send_0xc0(nvme_fd, video_path, sample_rate,
-                          jpeg_quality, &total_result_size) < 0 ||
+                          jpeg_quality, chroma_444, darknet_kernel,
+                          &total_result_size) < 0 ||
             total_result_size == 0) {
             fprintf(stderr, "[MAP] 0xC0 failed\n");
             close(nvme_fd); release_capture(cap); return 0;
         }
+        t_c0 = what_time_is_it_now() - t0;
+        transfer_bytes = total_result_size;
+
         size_t alloc_bytes = ((size_t)total_result_size + 4095) & ~(size_t)4095;
+        host_blob_bytes = alloc_bytes;
         result_buf = (uint8_t *)aligned_alloc(4096, alloc_bytes);
         if (!result_buf) {
             fprintf(stderr, "[MAP] alloc %zu bytes failed\n", alloc_bytes);
             close(nvme_fd); release_capture(cap); return 0;
         }
         memset(result_buf, 0, alloc_bytes);
+        t0 = what_time_is_it_now();
         if (ndp_send_0xc2(nvme_fd, result_buf, total_result_size) < 0) {
             fprintf(stderr, "[MAP] 0xC2 failed\n");
             free(result_buf); close(nvme_fd); release_capture(cap); return 0;
         }
+        t_io = what_time_is_it_now() - t0;
         memcpy(&num_ndp_frames, result_buf, sizeof(uint32_t));
         size_t header_bytes = (size_t)(1 + num_ndp_frames) * sizeof(uint32_t);
         if (num_ndp_frames == 0 || header_bytes > (size_t)total_result_size) {
@@ -1322,6 +1364,24 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
                     "[NDP-verify] decoded_frames log.\n");
                 free(result_buf); close(nvme_fd); release_capture(cap); return 0;
             }
+        }
+
+        /* In raw mode every entry must be exactly one letterboxed frame.
+         * A mismatch means the target and the host disagree on the network
+         * geometry, which would otherwise surface as silent garbage input. */
+        if (jpeg_quality == NDP_JPEG_Q_RAW) {
+            size_t expect = (size_t)net.w * net.h * 3;
+            if (jpeg_sizes[0] != expect) {
+                fprintf(stderr,
+                    "[MAP] raw frame size mismatch: got %u, expected %zu "
+                    "(net=%dx%d). Target and host disagree on geometry.\n",
+                    jpeg_sizes[0], expect, net.w, net.h);
+                free(result_buf); close(nvme_fd); release_capture(cap);
+                return 0;
+            }
+            printf("[MAP][VERIFY] raw RGB24 mode: %zu bytes/frame, "
+                   "%.1f MB total\n", expect,
+                   (double)total_result_size / (1024.0 * 1024.0));
         }
     }
  
@@ -1370,6 +1430,28 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
             fprintf(stderr, "[MAP] Warning: cannot create %s\n", save_img_dir);
     }
 
+    /* Per-frame payload statistics. The header is excluded so the numbers
+     * describe what one frame actually costs on the wire. */
+    if (use_ndp && num_ndp_frames > 0) {
+        double sum = 0.0;
+        for (uint32_t k = 0; k < num_ndp_frames; ++k) {
+            uint32_t sz = jpeg_sizes[k];
+            if (sz < frame_min) frame_min = sz;
+            if (sz > frame_max) frame_max = sz;
+            sum += (double)sz;
+        }
+        frame_avg = sum / (double)num_ndp_frames;
+    } else if (!use_ndp) {
+        /* The baseline ships the encoded source, so its per-frame cost is the
+         * file size spread over the frames it contains. */
+        struct stat st;
+        if (0 == stat(video_path, &st)) {
+            transfer_bytes = (uint32_t)st.st_size;
+            if (total_frames > 0) frame_avg = (double)st.st_size / total_frames;
+        }
+        t_e2e_start = what_time_is_it_now();
+    }
+
     time_t start = time(0);
  
     /* ---- frame loop ---- */
@@ -1378,9 +1460,18 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         image im_input;
         im_input.data = NULL; im_input.w = 0; im_input.h = 0; im_input.c = 0;
  
+        double t_stage = what_time_is_it_now();
         if (use_ndp) {
             if ((uint32_t)image_index >= num_ndp_frames) break;
-            im_input = ndp_jpeg_to_image(blob_base + blob_off, jpeg_sizes[image_index]);
+            if (jpeg_quality == NDP_JPEG_Q_RAW) {
+                im_input = ndp_raw_to_image(blob_base + blob_off,
+                                            jpeg_sizes[image_index],
+                                            net.w, net.h);
+            } else {
+                im_input = ndp_jpeg_to_image(blob_base + blob_off,
+                                             jpeg_sizes[image_index]);
+            }
+
             blob_off  += jpeg_sizes[image_index];
             decode_idx = image_index * sample_rate;
         } else {
@@ -1392,6 +1483,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
             if (in_img) release_mat(&in_img);
             if (!im_input.data || im_input.w == 0) break;
         }
+        t_pre += what_time_is_it_now() - t_stage;
  
         if (!im_input.data || im_input.w != net.w || im_input.h != net.h) {
             fprintf(stderr, "[MAP] frame %d: bad image (%dx%d), skipped\n",
@@ -1406,7 +1498,9 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
             continue;
         }
  
+        t_stage = what_time_is_it_now();
         network_predict(net, im_input.data);
+        t_infer += what_time_is_it_now() - t_stage;
  
         int nboxes = 0;
         /* Passing the source resolution rather than the 416x416 input size
@@ -1421,15 +1515,17 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         }
  
         char labelpath[4096];
-        snprintf(labelpath, sizeof(labelpath), "%s/%06d.txt",
-                 label_dir, decode_idx + label_base);
- 
         int num_labels = 0;
-        box_label *truth = read_boxes(labelpath, &num_labels);
-        if (num_labels == 0) ++missing_labels;
-        for (j = 0; j < num_labels; ++j)
-            if (truth[j].id >= 0 && truth[j].id < classes)
-                truth_classes_count[truth[j].id]++;
+        box_label *truth = NULL;
+        if (!perf_only) {
+            snprintf(labelpath, sizeof(labelpath), "%s/%06d.txt",
+                     label_dir, decode_idx + label_base);
+            truth = read_boxes(labelpath, &num_labels);
+            if (num_labels == 0) ++missing_labels;
+            for (j = 0; j < num_labels; ++j)
+                if (truth[j].id >= 0 && truth[j].id < classes)
+                    truth_classes_count[truth[j].id]++;
+        }
  
         const int checkpoint = ndets;
  
@@ -1531,6 +1627,8 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     }
     fprintf(stderr, "\n");
  
+    t_e2e = what_time_is_it_now() - t_e2e_start;
+
     const int num_eval_frames = image_index;
  
     /* ---- restrict scoring to classes that actually occur in the labels ----
@@ -1539,11 +1637,13 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     for (i = 0; i < classes; ++i) cls_to_compact[i] = -1;
     for (i = 0; i < classes; ++i) if (truth_classes_count[i] > 0) n_present++;
  
+    if (perf_only) goto measure_only;
+
     if (n_present == 0) {
         fprintf(stderr, "[MAP] No ground-truth labels found under %s "
-                        "(checked %d frames, %d missing). Aborting.\n",
+                        "(checked %d frames, %d missing). Skipping mAP.\n",
                 label_dir, num_eval_frames, missing_labels);
-        goto cleanup;
+        goto measure_only;
     }
  
     present_cls         = (int *)xcalloc(n_present, sizeof(int));
@@ -1644,7 +1744,42 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
                use_ndp ? "NDP" : "BASELINE", mean_ap_coco * 100);
     }
  
+measure_only:
     fprintf(stderr, "Total Detection Time: %d Seconds\n", (int)(time(0) - start));
+
+    /* One machine-readable line per run. Everything the comparison needs is
+     * here so the plotting script can grep a single pattern instead of
+     * scraping several differently-formatted messages.
+     *
+     * host_rss is the process peak resident set: for NDP it is dominated by
+     * the result blob, for the baseline by OpenCV's decode buffers. It does
+     * NOT cover GPU memory, and on the target side RSS is meaningless because
+     * SPDK reserves hugepages up front - the target reports its own allocation
+     * high-water mark instead, see [NDP-mem]. */
+    {
+        struct rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        printf("[MEASURE] mode=%s q=%d chroma=%s resize=%s frames=%d "
+               "e2e=%.3f target_pre=%.3f io=%.3f host_pre=%.3f infer=%.3f "
+               "bytes=%u frame_min=%u frame_avg=%.1f frame_max=%u "
+               "host_rss_mb=%.1f host_blob_mb=%.1f ap50=%.4f ap5095=%.4f\n",
+               use_ndp ? "ndp" : "baseline",
+               use_ndp ? (jpeg_quality ? jpeg_quality : 85) : -1,
+               !use_ndp || jpeg_quality == NDP_JPEG_Q_RAW ? "-"
+                   : (chroma_444 ? "444" : "420"),
+               !use_ndp ? "-" : (darknet_kernel ? "darknet" : "sws"),
+               num_eval_frames,
+               t_e2e, t_c0, t_io, t_pre, t_infer,
+               transfer_bytes,
+               frame_min == 0xFFFFFFFFu ? 0u : frame_min,
+               frame_avg, frame_max,
+               (double)ru.ru_maxrss / 1024.0,
+               (double)host_blob_bytes / (1024.0 * 1024.0),
+               /* -1 rather than 0 when no mAP was computed: 0 is a legitimate
+                * score, so it must not be confused with "not measured". */
+               n_present ? mean_ap * 100.0 : -1.0,
+               n_present ? mean_ap_coco * 100.0 : -1.0);
+    }
  
 cleanup:
     if (logfp) {
@@ -2754,7 +2889,10 @@ static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out)
  * Payload : serialised extent table, [lba0, blk0, lba1, blk1, ...]
  * cdw10   : extent count
  * cdw11   : sample rate, keep 1 frame out of N (0 means 1)
- * cdw12   : [7:0] JPEG quality 1-100 (0 means target default of 85)
+ * cdw12   : [7:0] JPEG quality 1-100 (0 means target default of 85,
+ *                 101 means no compression at all)
+ *           [8]   chroma 4:4:4 instead of 4:2:0
+ *           [9]   darknet-compatible resampling kernel instead of swscale
  * cdw0    : (response) total byte size of the result buffer
  *
  * The ioctl blocks until the target's worker thread has finished the entire
@@ -2764,7 +2902,8 @@ static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out)
  *   [uint32 frame_count][uint32 jpeg_size x N][JPEG blob x N]
  */
 static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
-                         int sample_rate, int jpeg_quality,
+                         int sample_rate, int jpeg_quality, int chroma_444,
+                         int darknet_kernel,
                          uint32_t *total_result_size_out)
 {
     ndp_extent_table_t ext = {0};
@@ -2792,7 +2931,9 @@ static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
         u64[2 * i + 1] = ext.blk[i];
     }
  
-    uint32_t cdw12 = (uint32_t)(jpeg_quality & 0xFF);
+    uint32_t cdw12 = (uint32_t)(jpeg_quality & 0xFF)
+                   | ((chroma_444    ? 1u : 0u) << 8)
+                   | ((darknet_kernel ? 1u : 0u) << 9);
  
     struct nvme_passthru_cmd cmd = {
         .opcode     = 0xC0,
@@ -2802,14 +2943,16 @@ static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
         .data_len   = (uint32_t)buf_bytes,
         .cdw10      = ext.count,
         .cdw11      = (uint32_t)(sample_rate  & 0xFFFF),
-        .cdw12      = (uint32_t)(jpeg_quality & 0xFF),
+        .cdw12      = cdw12,
         .timeout_ms = NDP_NVME_TIMEOUT_MS,
     };
  
     printf("[NDP] Sending 0xC0 (data_len=%zu, cdw10=%u, sample_rate=1/%d, "
-           "jpeg_q=%d, cdw12=0x%08x) ...\n",
+           "jpeg_q=%d, chroma=%s, resize=%s, cdw12=0x%08x) ...\n",
            buf_bytes, ext.count, sample_rate,
-           jpeg_quality ? jpeg_quality : 85, cdw12);
+           jpeg_quality ? jpeg_quality : 85,
+           chroma_444 ? "4:4:4" : "4:2:0",
+           darknet_kernel ? "darknet" : "swscale", cdw12);
     fflush(stdout);
  
     int ret = ioctl(nvme_fd, NVME_IOCTL_IO_CMD, &cmd);
@@ -2929,7 +3072,8 @@ void ndp_test_detector(char *datacfg, char *cfgfile, char *weightfile,
      *   ([uint32 frame_count][uint32 jpeg_size × N][JPEG blob × N])
      */
     uint32_t total_result_size = 0;
-      if (ndp_send_0xc0(nvme_fd, mp4_path, ndp_sample_rate, 0, &total_result_size) < 0)
+      if (ndp_send_0xc0(nvme_fd, mp4_path, ndp_sample_rate, 0, 0, 0,
+                        &total_result_size) < 0)
         goto cleanup_fd;
  
     if (total_result_size == 0) {
@@ -3145,7 +3289,11 @@ static void ndp_print_usage(const char *prog)
 "video_map options\n"
 "  -labels <dir>       Ground-truth directory holding <frame>.txt files in\n"
 "                      YOLO format (class cx cy w h, normalised to the source\n"
-"                      resolution). Required.\n"
+"                      resolution). Omit it to run in performance-only mode:\n"
+"                      the pipeline still runs and the [MEASURE] line is still\n"
+"                      printed, but no ground truth is read and no mAP is\n"
+"                      computed. Use that for footage with no annotations,\n"
+"                      where only latency, transfer volume and memory matter.\n"
 "  -ndp                Evaluate the NDP pipeline. Without this flag the host\n"
 "                      baseline is evaluated instead.\n"
 "  -label_base <N>     Label file number for the first decoded frame.\n"
@@ -3157,7 +3305,26 @@ static void ndp_print_usage(const char *prog)
 "                      IoU = 0.50:0.05:0.95.\n"
 "  -jpeg_q <N>         JPEG quality used by the target when re-encoding,\n"
 "                      1-100 in steps of 1. 0 uses the target default of 85.\n"
+"                      -1 (or 101) disables the encoder and ships the\n"
+"                      letterboxed RGB24 frames uncompressed, at 519168 B\n"
+"                      per frame. Diagnostic only: it isolates the\n"
+"                      resampling kernel from the compression loss.\n"
 "                      NDP mode only; forwarded in cdw12.\n"
+"  -chroma <420|444>   Chroma sampling used by the target's JPEG encoder.\n"
+"                      Default 420. libjpeg subsamples chroma even at\n"
+"                      quality 100, so 444 is required for a run that is\n"
+"                      meant to isolate the resampling kernel from the\n"
+"                      compression loss. NDP mode only; cdw12 bit 8.\n"
+"  -resize <sws|darknet>\n"
+"                      Resampling kernel the target uses to downscale each\n"
+"                      frame. Default sws: swscale converts colour and\n"
+"                      scales in one pass, but its bilinear filter widens\n"
+"                      with the downscale ratio and low-passes the source.\n"
+"                      darknet restricts swscale to the colour conversion\n"
+"                      and reproduces darknet resize_image() afterwards, so\n"
+"                      the offloaded frames match what the host baseline\n"
+"                      feeds the network. Costs one extra full-resolution\n"
+"                      RGB buffer per frame. NDP mode only; cdw12 bit 9.\n"
 "\n"
 "video_map output options\n"
 "  -save_img <dir>     Save one 416x416 image per evaluated frame with\n"
@@ -3305,16 +3472,43 @@ void run_detector(int argc, char **argv)
         int   sample_rate = find_int_arg(argc, argv, "-sample_rate", 1);
         int   label_base  = find_int_arg(argc, argv, "-label_base", 1);
         int   coco_range  = find_arg(argc, argv, "-coco_map");
-        /* 0 이면 타겟 기본값(85) 사용 */
+        /* 0 = 타겟 기본값(85), 1-100 = 품질, -1 또는 101 = 압축 미사용 */
         int   jpeg_q      = find_int_arg(argc, argv, "-jpeg_q", 0);
-        if (!video_path || !label_dir || find_arg(argc, argv, "-help")) {
+        if (jpeg_q == -1) jpeg_q = NDP_JPEG_Q_RAW;
+        if (jpeg_q < 0 || (jpeg_q > 100 && jpeg_q != NDP_JPEG_Q_RAW)) {
+            fprintf(stderr, "[MAP] -jpeg_q must be 0-100, or -1/101 for raw "
+                            "(got %d)\n", jpeg_q);
+            return;
+        }
+        int   chroma_arg  = find_int_arg(argc, argv, "-chroma", 420);
+        int   chroma_444  = 0;
+        if      (chroma_arg == 444) chroma_444 = 1;
+        else if (chroma_arg == 420) chroma_444 = 0;
+        else {
+            fprintf(stderr, "[MAP] -chroma must be 420 or 444 (got %d)\n",
+                    chroma_arg);
+            return;
+        }
+        /* Which resampling kernel the target uses to downscale the frame. */
+        char *resize_arg    = find_char_arg(argc, argv, "-resize", "sws");
+        int   darknet_kernel = 0;
+        if      (0 == strcmp(resize_arg, "darknet")) darknet_kernel = 1;
+        else if (0 == strcmp(resize_arg, "sws"))     darknet_kernel = 0;
+        else {
+            fprintf(stderr, "[MAP] -resize must be sws or darknet (got %s)\n",
+                    resize_arg);
+            return;
+        }
+        /* label_dir may be NULL: that selects performance-only mode. */
+        if (!video_path || find_arg(argc, argv, "-help")) {
             ndp_print_usage(argv[0]);
             return;
         }
         validate_video_map(datacfg, cfg, weights, video_path, label_dir,
                            nvme_dev, use_ndp, sample_rate, label_base,
                            thresh, iou_thresh, map_points, coco_range,
-                           jpeg_q, save_img, save_log);
+                           jpeg_q, chroma_444, darknet_kernel,
+                           save_img, save_log);
     }
     else if (0 == strcmp(argv[2], "demo")) {
         list *options = read_data_cfg(datacfg);
