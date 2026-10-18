@@ -43,8 +43,10 @@
 #define NDP_MAX_EXTENTS      128
  
 /* The 0xC0 ioctl blocks until the target finishes decoding the whole clip,
- * so the timeout has to cover worst-case preprocessing, not just I/O. */
-#define NDP_NVME_TIMEOUT_MS  120000
+ * so the timeout has to cover worst-case preprocessing, not just I/O.
+ * Raised from 120 s to 600 s: AV1 4K is decoded in software on the storage
+ * node and a full-length clip can exceed two minutes on its own. */
+#define NDP_NVME_TIMEOUT_MS  600000
 
 typedef struct {
     uint32_t count;
@@ -55,7 +57,7 @@ typedef struct {
 static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out);
 static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
                          int sample_rate, int jpeg_quality, int chroma_444,
-                         int darknet_kernel,
+                         int darknet_kernel, uint32_t run_id,
                          uint32_t *total_result_size_out);
 static int ndp_send_0xc2(int nvme_fd, void *buf, uint32_t total_bytes);
 
@@ -1201,13 +1203,32 @@ static double vmap_compute_map(const vmap_det_t *dets, int ndets,
  * label_base); MOT-style datasets whose first frame is 000001.jpg need
  * label_base = 1.
  */
+/* Process CPU time in seconds. RUSAGE_SELF counts every thread, so the
+ * FFmpeg decoder threads are included - which is what the loop totals want,
+ * and what makes the per-stage split approximate (see [MEASURE] note). */
+static void vmap_cpu_times(double *user, double *sys)
+{
+    struct rusage r;
+    getrusage(RUSAGE_SELF, &r);
+    if (user) *user = (double)r.ru_utime.tv_sec + (double)r.ru_utime.tv_usec * 1e-6;
+    if (sys)  *sys  = (double)r.ru_stime.tv_sec + (double)r.ru_stime.tv_usec * 1e-6;
+}
+
+static double vmap_cpu_total(void)
+{
+    double u = 0.0, sy = 0.0;
+    vmap_cpu_times(&u, &sy);
+    return u + sy;
+}
+
 float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
                          char *video_path, char *label_dir, char *nvme_dev,
                          int use_ndp, int sample_rate, int label_base,
                          float thresh_calc_avg_iou, const float iou_thresh,
                          const int map_points, int coco_range,
                          int jpeg_quality, int chroma_444, int darknet_kernel,
-                         char *save_img_dir, char *save_log_path)
+                         char *save_img_dir, char *save_log_path,
+                         char *dump_dets_path, uint32_t run_id)
 {
     int i, j;
  
@@ -1301,7 +1322,12 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
      * network forward pass. */
     double t_e2e_start = 0.0, t_e2e = 0.0;
     double t_c0 = 0.0, t_io = 0.0, t_pre = 0.0, t_infer = 0.0;
-    uint32_t transfer_bytes = 0;
+    /* CPU time, not wall time. Read outside each wall-clock window so the
+     * getrusage() cost never lands inside t_pre / t_infer. */
+    double t_cpu_pre = 0.0, t_cpu_infer = 0.0;
+    double cpu_user_start = 0.0, cpu_sys_start = 0.0;
+    double cpu_user_loop  = 0.0, cpu_sys_loop  = 0.0;
+    uint64_t transfer_bytes = 0;
     uint32_t frame_min = 0xFFFFFFFFu, frame_max = 0;
     double   frame_avg = 0.0;
     size_t   host_blob_bytes = 0;
@@ -1317,7 +1343,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         t_e2e_start = what_time_is_it_now();
         double t0 = what_time_is_it_now();
         if (ndp_send_0xc0(nvme_fd, video_path, sample_rate,
-                          jpeg_quality, chroma_444, darknet_kernel,
+                          jpeg_quality, chroma_444, darknet_kernel, run_id,
                           &total_result_size) < 0 ||
             total_result_size == 0) {
             fprintf(stderr, "[MAP] 0xC0 failed\n");
@@ -1446,13 +1472,18 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
          * file size spread over the frames it contains. */
         struct stat st;
         if (0 == stat(video_path, &st)) {
-            transfer_bytes = (uint32_t)st.st_size;
+            transfer_bytes = (uint64_t)st.st_size;
             if (total_frames > 0) frame_avg = (double)st.st_size / total_frames;
         }
         t_e2e_start = what_time_is_it_now();
     }
 
     time_t start = time(0);
+
+    /* Baseline sub-stage timers and the CPU-time baseline, taken immediately
+     * before the loop so they cover exactly the same work as t_pre/t_infer. */
+    bl_timers_reset();
+    vmap_cpu_times(&cpu_user_start, &cpu_sys_start);
  
     /* ---- frame loop ---- */
     int decode_idx = 0;
@@ -1460,6 +1491,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         image im_input;
         im_input.data = NULL; im_input.w = 0; im_input.h = 0; im_input.c = 0;
  
+        double c_stage = vmap_cpu_total();
         double t_stage = what_time_is_it_now();
         if (use_ndp) {
             if ((uint32_t)image_index >= num_ndp_frames) break;
@@ -1484,6 +1516,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
             if (!im_input.data || im_input.w == 0) break;
         }
         t_pre += what_time_is_it_now() - t_stage;
+        t_cpu_pre += vmap_cpu_total() - c_stage;
  
         if (!im_input.data || im_input.w != net.w || im_input.h != net.h) {
             fprintf(stderr, "[MAP] frame %d: bad image (%dx%d), skipped\n",
@@ -1498,9 +1531,11 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
             continue;
         }
  
+        c_stage = vmap_cpu_total();
         t_stage = what_time_is_it_now();
         network_predict(net, im_input.data);
         t_infer += what_time_is_it_now() - t_stage;
+        t_cpu_infer += vmap_cpu_total() - c_stage;
  
         int nboxes = 0;
         /* Passing the source resolution rather than the 416x416 input size
@@ -1628,6 +1663,12 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     fprintf(stderr, "\n");
  
     t_e2e = what_time_is_it_now() - t_e2e_start;
+    {
+        double u = 0.0, sy = 0.0;
+        vmap_cpu_times(&u, &sy);
+        cpu_user_loop = u - cpu_user_start;
+        cpu_sys_loop  = sy - cpu_sys_start;
+    }
 
     const int num_eval_frames = image_index;
  
@@ -1747,6 +1788,38 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
 measure_only:
     fprintf(stderr, "Total Detection Time: %d Seconds\n", (int)(time(0) - start));
 
+    /* ---- detection dump (-dump_dets) ----
+     * Written here, after every timer has already been read, so this file I/O
+     * cannot land inside a measured window. dets_all is filled for every
+     * processed frame irrespective of perf_only - the box computation is not
+     * conditional on having labels - so the dump also works on footage with
+     * no annotations. get_network_boxes() was given the source geometry, so
+     * the stored boxes are already letterbox-corrected and normalised to the
+     * source frame; convert to top-left pixel form on the way out. The
+     * confidence floor is the same 0.005 the AP integration uses, and every
+     * class is written: filtering belongs in the offline analysis. */
+    if (dump_dets_path) {
+        FILE *df = fopen(dump_dets_path, "w");
+        if (!df) {
+            fprintf(stderr, "[MAP] Cannot open dump file %s: %s\n",
+                    dump_dets_path, strerror(errno));
+        } else {
+            fprintf(df, "frame_idx,class_id,conf,x,y,w,h\n");
+            for (i = 0; i < ndets; ++i) {
+                const box bb = dets_all[i].b;
+                const double px = ((double)bb.x - (double)bb.w / 2.0) * orig_w;
+                const double py = ((double)bb.y - (double)bb.h / 2.0) * orig_h;
+                fprintf(df, "%d,%d,%.6f,%.2f,%.2f,%.2f,%.2f\n",
+                        dets_all[i].image_index * sample_rate,
+                        dets_all[i].class_id, dets_all[i].p,
+                        px, py, (double)bb.w * orig_w, (double)bb.h * orig_h);
+            }
+            fclose(df);
+            printf("[MAP] detection dump written: %s (%d rows)\n",
+                   dump_dets_path, ndets);
+        }
+    }
+
     /* One machine-readable line per run. Everything the comparison needs is
      * here so the plotting script can grep a single pattern instead of
      * scraping several differently-formatted messages.
@@ -1761,8 +1834,11 @@ measure_only:
         getrusage(RUSAGE_SELF, &ru);
         printf("[MEASURE] mode=%s q=%d chroma=%s resize=%s frames=%d "
                "e2e=%.3f target_pre=%.3f io=%.3f host_pre=%.3f infer=%.3f "
-               "bytes=%u frame_min=%u frame_avg=%.1f frame_max=%u "
-               "host_rss_mb=%.1f host_blob_mb=%.1f ap50=%.4f ap5095=%.4f\n",
+               "bytes=%llu frame_min=%u frame_avg=%.1f frame_max=%u "
+               "host_rss_mb=%.1f host_blob_mb=%.1f ap50=%.4f ap5095=%.4f "
+               "run_id=%u bl_decode_s=%.3f bl_copy_s=%.3f bl_mat2img_s=%.3f "
+               "bl_letterbox_s=%.3f host_cpu_user_s=%.3f host_cpu_sys_s=%.3f "
+               "host_cpu_pre_s=%.3f host_cpu_infer_s=%.3f\n",
                use_ndp ? "ndp" : "baseline",
                use_ndp ? (jpeg_quality ? jpeg_quality : 85) : -1,
                !use_ndp || jpeg_quality == NDP_JPEG_Q_RAW ? "-"
@@ -1770,7 +1846,7 @@ measure_only:
                !use_ndp ? "-" : (darknet_kernel ? "darknet" : "sws"),
                num_eval_frames,
                t_e2e, t_c0, t_io, t_pre, t_infer,
-               transfer_bytes,
+               (unsigned long long)transfer_bytes,
                frame_min == 0xFFFFFFFFu ? 0u : frame_min,
                frame_avg, frame_max,
                (double)ru.ru_maxrss / 1024.0,
@@ -1778,7 +1854,20 @@ measure_only:
                /* -1 rather than 0 when no mAP was computed: 0 is a legitimate
                 * score, so it must not be confused with "not measured". */
                n_present ? mean_ap * 100.0 : -1.0,
-               n_present ? mean_ap_coco * 100.0 : -1.0);
+               n_present ? mean_ap_coco * 100.0 : -1.0,
+               run_id,
+               /* Baseline sub-stages. Zero in NDP mode: the four buckets live
+                * inside get_image_from_stream_letterbox(), which NDP never
+                * calls. Their sum reproduces host_pre up to timer overhead
+                * plus the caller's own release_mat() of the in_img copy. */
+               bl_t_decode, bl_t_copy, bl_t_mat2img, bl_t_letterbox,
+               /* Loop CPU time, all threads. The per-stage split is
+                * approximate: FFmpeg decoder threads keep burning CPU after
+                * get_capture_frame_cv() returns, so some decode CPU lands in
+                * whichever stage happens to be running. The inference figure
+                * also includes CUDA's synchronisation spin-wait, which is
+                * left at its default setting on purpose. */
+               cpu_user_loop, cpu_sys_loop, t_cpu_pre, t_cpu_infer);
     }
  
 cleanup:
@@ -2893,6 +2982,9 @@ static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out)
  *                 101 means no compression at all)
  *           [8]   chroma 4:4:4 instead of 4:2:0
  *           [9]   darknet-compatible resampling kernel instead of swscale
+ * cdw13   : opaque 32-bit run ID, echoed by the target into its own
+ *           [NDP-MEASURE] line so host rows and target rows can be paired
+ *           without relying on timestamps. 0 means "not set".
  * cdw0    : (response) total byte size of the result buffer
  *
  * The ioctl blocks until the target's worker thread has finished the entire
@@ -2903,7 +2995,7 @@ static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out)
  */
 static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
                          int sample_rate, int jpeg_quality, int chroma_444,
-                         int darknet_kernel,
+                         int darknet_kernel, uint32_t run_id,
                          uint32_t *total_result_size_out)
 {
     ndp_extent_table_t ext = {0};
@@ -2944,15 +3036,16 @@ static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
         .cdw10      = ext.count,
         .cdw11      = (uint32_t)(sample_rate  & 0xFFFF),
         .cdw12      = cdw12,
+        .cdw13      = run_id,
         .timeout_ms = NDP_NVME_TIMEOUT_MS,
     };
  
     printf("[NDP] Sending 0xC0 (data_len=%zu, cdw10=%u, sample_rate=1/%d, "
-           "jpeg_q=%d, chroma=%s, resize=%s, cdw12=0x%08x) ...\n",
+           "jpeg_q=%d, chroma=%s, resize=%s, cdw12=0x%08x, run_id=%u) ...\n",
            buf_bytes, ext.count, sample_rate,
            jpeg_quality ? jpeg_quality : 85,
            chroma_444 ? "4:4:4" : "4:2:0",
-           darknet_kernel ? "darknet" : "swscale", cdw12);
+           darknet_kernel ? "darknet" : "swscale", cdw12, run_id);
     fflush(stdout);
  
     int ret = ioctl(nvme_fd, NVME_IOCTL_IO_CMD, &cmd);
@@ -3072,7 +3165,7 @@ void ndp_test_detector(char *datacfg, char *cfgfile, char *weightfile,
      *   ([uint32 frame_count][uint32 jpeg_size × N][JPEG blob × N])
      */
     uint32_t total_result_size = 0;
-      if (ndp_send_0xc0(nvme_fd, mp4_path, ndp_sample_rate, 0, 0, 0,
+      if (ndp_send_0xc0(nvme_fd, mp4_path, ndp_sample_rate, 0, 0, 0, 0,
                         &total_result_size) < 0)
         goto cleanup_fd;
  
@@ -3336,6 +3429,20 @@ static void ndp_print_usage(const char *prog)
 "                      type is 'det' or 'gt'. Coordinates are normalised to\n"
 "                      the source resolution, identical to the label format,\n"
 "                      so the log can be compared with the labels directly.\n"
+"  -dump_dets <file>   Write every detection of every processed frame to a\n"
+"                      CSV for offline accuracy analysis:\n"
+"                        frame_idx,class_id,conf,x,y,w,h\n"
+"                      frame_idx is the source video frame number\n"
+"                      (image_index * sample_rate); x,y is the top-left\n"
+"                      corner and w,h the size, both in source-resolution\n"
+"                      pixels. Confidence floor 0.005 and NMS 0.45, the same\n"
+"                      as the mAP path; all classes are written. Works\n"
+"                      without -labels, and the file is written after every\n"
+"                      timer has been read so it cannot affect the latency\n"
+"                      numbers.\n"
+"  -run_id <n>         32-bit tag for this run. Forwarded to the target in\n"
+"                      cdw13 and printed as run_id= in [MEASURE], so host\n"
+"                      and target rows can be paired without timestamps.\n"
 "\n"
 "Examples\n"
 "  # A: host baseline, every frame\n"
@@ -3468,6 +3575,11 @@ void run_detector(int argc, char **argv)
         char *label_dir   = find_char_arg(argc, argv, "-labels",   NULL);
         char *save_img    = find_char_arg(argc, argv, "-save_img", NULL);
         char *save_log    = find_char_arg(argc, argv, "-save_log", NULL);
+        char *dump_dets   = find_char_arg(argc, argv, "-dump_dets", NULL);
+        /* Opaque tag echoed to the target in cdw13 and printed in
+         * [MEASURE], so a host row and a target row can be paired without
+         * relying on wall-clock timestamps. */
+        uint32_t run_id   = (uint32_t)find_int_arg(argc, argv, "-run_id", 0);
         int   use_ndp     = find_arg(argc, argv, "-ndp");
         int   sample_rate = find_int_arg(argc, argv, "-sample_rate", 1);
         int   label_base  = find_int_arg(argc, argv, "-label_base", 1);
@@ -3508,7 +3620,7 @@ void run_detector(int argc, char **argv)
                            nvme_dev, use_ndp, sample_rate, label_base,
                            thresh, iou_thresh, map_points, coco_range,
                            jpeg_q, chroma_444, darknet_kernel,
-                           save_img, save_log);
+                           save_img, save_log, dump_dets, run_id);
     }
     else if (0 == strcmp(argv[2], "demo")) {
         list *options = read_data_cfg(datacfg);

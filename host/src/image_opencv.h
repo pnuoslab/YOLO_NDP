@@ -49,6 +49,23 @@ image mat_to_image_cv(mat_cv *mat);
 image ndp_jpeg_to_image(const unsigned char *buf, size_t len);
 image ndp_raw_to_image(const unsigned char *buf, size_t len, int w, int h);
 
+/* Baseline preprocessing breakdown, accumulated inside
+ * get_image_from_stream_letterbox(). Seconds, same clock as
+ * what_time_is_it_now(). The four buckets partition the function body, so
+ * their sum reproduces the caller's own per-frame measurement up to the
+ * timer call overhead. Each bucket also owns the deallocation of the buffer
+ * it allocated, so no free() is left unattributed:
+ *   bl_t_decode    get_capture_frame_cv() + wait_for_stream() + release_mat()
+ *   bl_t_copy      full-resolution cv::Mat copy (cv::resize) + cvtColor()
+ *   bl_t_mat2img   mat_to_image() + free_image() of its full-res buffer
+ *   bl_t_letterbox letterbox_image()
+ * Not covered: the caller's own release_mat() of the in_img copy. */
+extern double bl_t_decode;
+extern double bl_t_copy;
+extern double bl_t_mat2img;
+extern double bl_t_letterbox;
+void bl_timers_reset(void);
+
 // Window
 void create_window_cv(char const* window_name, int full_screen, int width, int height);
 void resize_window_cv(char const* window_name, int width, int height);

@@ -856,33 +856,65 @@ extern "C" image get_image_from_stream_resize(cap_cv *cap, int w, int h, int c, 
 }
 // ----------------------------------------
 
+/* Baseline preprocessing breakdown. See image_opencv.h for what each bucket
+ * covers. These are plain accumulators rather than a struct so that the C
+ * side can read them without a shared type; the measured path is single
+ * threaded, so no synchronisation is needed. */
+extern "C" {
+double bl_t_decode    = 0.0;
+double bl_t_copy      = 0.0;
+double bl_t_mat2img   = 0.0;
+double bl_t_letterbox = 0.0;
+}
+
+extern "C" void bl_timers_reset(void)
+{
+    bl_t_decode = bl_t_copy = bl_t_mat2img = bl_t_letterbox = 0.0;
+}
+
 extern "C" image get_image_from_stream_letterbox(cap_cv *cap, int w, int h, int c, mat_cv** in_img, int dont_close)
 {
     c = c ? c : 3;
     cv::Mat *src = NULL;
     static int once = 1;
+    double t_stage = what_time_is_it_now();
     if (once) {
         once = 0;
         do {
             if (src) delete src;
             src = (cv::Mat*)get_capture_frame_cv(cap);
-            if (!src) return make_empty_image(0, 0, 0);
+            if (!src) { bl_t_decode += what_time_is_it_now() - t_stage; return make_empty_image(0, 0, 0); }
         } while (src->cols < 1 || src->rows < 1 || src->channels() < 1);
         printf("Video stream: %d x %d \n", src->cols, src->rows);
     }
     else
         src = (cv::Mat*)get_capture_frame_cv(cap);
 
-    if (!wait_for_stream(cap, src, dont_close)) return make_empty_image(0, 0, 0);   // passes (cv::Mat *)src while should be (cv::Mat **)src
+    if (!wait_for_stream(cap, src, dont_close)) { bl_t_decode += what_time_is_it_now() - t_stage; return make_empty_image(0, 0, 0); }   // passes (cv::Mat *)src while should be (cv::Mat **)src
+    bl_t_decode += what_time_is_it_now() - t_stage;
 
+    t_stage = what_time_is_it_now();
     *in_img = (mat_cv *)new cv::Mat(src->rows, src->cols, CV_8UC(c));
     cv::resize(*src, **(cv::Mat**)in_img, (*(cv::Mat**)in_img)->size(), 0, 0, cv::INTER_LINEAR);
 
     if (c>1) cv::cvtColor(*src, *src, cv::COLOR_RGB2BGR);
+    bl_t_copy += what_time_is_it_now() - t_stage;
+
+    t_stage = what_time_is_it_now();
     image tmp = mat_to_image(*src);
+    bl_t_mat2img += what_time_is_it_now() - t_stage;
+
+    t_stage = what_time_is_it_now();
     image im = letterbox_image(tmp, w, h);
+    bl_t_letterbox += what_time_is_it_now() - t_stage;
+
+    t_stage = what_time_is_it_now();
     free_image(tmp);
+    bl_t_mat2img += what_time_is_it_now() - t_stage;
+
+    t_stage = what_time_is_it_now();
     release_mat((mat_cv **)&src);
+    bl_t_decode += what_time_is_it_now() - t_stage;
 
     //show_image_cv(im, "im");
     //show_image_mat(*in_img, "in_img");
