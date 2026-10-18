@@ -316,6 +316,48 @@ YOLO 라벨 파일도 5개 시퀀스 전부 생성했다(프레임 수 = `seqLen
 
 ---
 
+## 4-2. §6 경로 확인 테스트 결과 (host 측) — **PASS**
+
+2026-10-19 05:56, 사용자가 볼륨을 연결·마운트하고 입력 12개를 복사한 직후 `sudo -E ./run_pathcheck.sh` 로 실행했다. 원시 스냅샷: `~/ndp_results/pathcheck/S{0..3}.hstat`, 실행 로그: `~/ndp_results_pathcheck.log`.
+
+`/sys/block/nvme1n1/stat` 차분 (섹터 × 512 B):
+
+| 구간 | 내용 | host 읽기 | host 쓰기 | io_ticks | 소요 | 처리율 |
+|---|---|---|---|---|---|---|
+| S0→S1 | `dd oflag=direct` 512 MiB 쓰기 + `sync` | 0 | **537,038,848** | 651 ms | 1.908 s | 281 MB/s |
+| S1→S2 | `drop_caches` 후 읽기 | **536,870,912** | 0 | 459 ms | 0.461 s | 1.2 GB/s |
+| S2→S3 | 캐시 **안 비우고** 다시 읽기 | **0** | 0 | **0 ms** | 0.024 s | 22.2 GB/s |
+
+```
+S0: rd_sect=15162    wr_sect=3456000  io_ticks=2620
+S1: rd_sect=15162    wr_sect=4504904  io_ticks=3271
+S2: rd_sect=1063738  wr_sect=4504904  io_ticks=3730
+S3: rd_sect=1063738  wr_sect=4504904  io_ticks=3730
+```
+
+해석:
+- **콜드 읽기는 명목값의 정확히 100.0%가 장치에 도달했다**(536,870,912 B = 1,048,576 섹터).
+- **웜 읽기는 장치 트래픽 0, io_ticks 0이다.** 같은 512 MiB를 22.2 GB/s(메모리 대역폭)로 돌려줬다. **page cache에 있는 파일을 읽는 실행은 장치 I/O를 전혀 재지 않는다** — 명세 01의 지적("9월 Baseline은 `drop_caches` 없이 복사 직후 실행됐다")이 실제로 측정을 무효화하는 문제였다는 직접 증거다. 재측정에서 매 실행 전에 `drop_caches` 를 하는 근거이기도 하다.
+- 쓰기가 명목값보다 **167,936 B(164 KiB) 많다.** ext4 메타데이터와 저널 기록분이다. 이 정도 오버헤드는 Baseline의 "파일 크기 = 전송량" 정의(명세 01 H7-3)가 실제 장치 I/O와 0.03% 이내로 맞는다는 뜻이기도 하다.
+- 콜드 읽기 **1.2 GB/s ≈ 9.6 Gb/s** 로 10GbE 링크 속도에 거의 붙어 있다. NVMe-oF 경로가 **네트워크 대역폭에 묶여 있다**는 뜻이다. 4K 입력(`res2160_h264.mp4`, 378 MB)을 Baseline이 읽는 데 순수 전송만 약 0.31 s가 든다.
+- S0의 `wr_sect=3,456,000` (1.77 GB)는 직전 사용자 `cp` 로 입력 12개(1.77 GB)를 쓴 분이다. 크기가 맞는다.
+
+**target 측 대조는 하지 못했다.** `TARGET_HOST` 가 비어 있어 `bdev_get_iostat` 열이 `n/a` 다(§7-4의 ssh 문제). target 세션에서 같은 시각(05:56)의 iostat 차분을 받아 대조해야 명세 §6-6이 완료된다.
+
+### 볼륨 상태에 대해 새로 확인된 것
+
+1. **볼륨이 2026-08-31 이후 한 번도 다시 포맷되지 않았다.** `lost+found` 생성 시각이 `2026-08-31 16:51:22`, 옛 파일 `MOT17_04.mp4`(8/31)와 `testd_15s.mp4`(9/14)가 남아 있다. 원인은 사용자 로그에서 확인됐다 — 기존 ext4가 있으면 `mkfs.ext4` 가 묻는다:
+   ```
+   /dev/nvme1n1 contains a ext4 file system
+           last mounted on /mnt/ext4 on Mon Sep 14 19:42:01 2026
+   Proceed anyway? (y,N)
+   ```
+   여기서 Enter는 **N** 이고 mkfs는 아무 메시지 없이 취소된다. 9월 기록의 `mkfs.ext4` 들도 같은 식으로 넘어갔을 가능성이 크다(**추정**). 측정 정확성에는 영향이 없지만, "매번 깨끗한 볼륨에서 실험했다"고 본문에 쓰면 사실과 다르다.
+2. **extent 수는 문제없다.** 오래된 파일시스템이라 조각화를 의심했지만 `filefrag` 결과 입력 12개 모두 **1~5 extent** 다. 0xC0 상한(`NDP_MAX_EXTENTS=128`)에 한참 못 미친다.
+3. 파일시스템 크기 916 GB, 사용 1.8 GB(1%).
+
+---
+
 ## 5. §9 사전 검증 (NVMe-oF 없이 가능한 부분)
 
 target과 NVMe-oF가 필요한 4개 스모크 실행은 아직 못 했지만, **Baseline 경로와 덤프·CSV 조립은 로컬 영상으로 검증했다.**
@@ -463,7 +505,9 @@ sudo -E TARGET_HOST=oslab-server3 ./run_pathcheck.sh
 
 측정용 입력은 건드리지 않고 `iotest.bin` 하나만 쓰고 지운다.
 
-### 7-1. target 기동 — **현재 `nvmf_tgt` 가 떠 있지 않다 (확인된 문제)**
+### 7-1. target 기동 — 05:5x 해결됨 (아래는 그 전 상태 기록)
+
+target 세션이 `nvmf_tgt` 를 띄운 뒤 4420이 열렸고(`4420 OPEN`), 사용자가 연결·마운트·복사를 마쳤다. 아래는 그 전에 관찰한 상태다.
 
 `nvme connect` 가 실패하는 이유는 입력 오류가 아니다. target에 SPDK가 안 떠 있다:
 
@@ -535,6 +579,40 @@ ssh: connect to host 192.168.100.2 port 22: Connection refused
 **영향**: ssh가 없으면 `run_all.sh` 의 target 관련 열(`tgt_bytes_read` 등 iostat 차분, target `[NDP-MEASURE]`)이 전부 비고, §6-7 대조도 못 한다. 스크립트는 ssh 실패를 무시하고 진행하도록 돼 있어 측정 자체는 멈추지 않지만, **"NDP의 0xC0이 SSD에서 파일 크기만큼 읽었는가"를 확인할 수 없게 된다** — 명세 §9의 확인 항목 중 하나다.
 
 **필요한 것**: target의 관리용 IP 또는 호스트명과, 거기로 비밀번호 없이 ssh가 되는 설정(`/etc/hosts` 항목 또는 `~/.ssh/config`). 추가로 `rpc.py bdev_get_iostat` 호출 권한이 필요하다(`TARGET_RPC` 기본값 `/root/spdk/scripts/rpc.py`; 경로가 다르면 알려주세요).
+
+---
+
+## 7-5. 볼륨 준비 자동화와 명세 §1 규칙 변경안
+
+사용자 요청(2026-10-19): 볼륨 준비를 Claude가 할 수 있게 명세를 바꿀 것. 두 가지로 나눠 처리했다.
+
+**(a) 스크립트 — 완료.** [setup_volume.sh](setup_volume.sh), [teardown_volume.sh](teardown_volume.sh).
+
+- 포맷 대상 장치를 고정 이름(`/dev/nvme1n1`)으로 받지 않는다. sysfs에서 **NQN `nqn.2016-06.io.spdk:cnode1` 서브시스템의 네임스페이스**를 찾고, 그 서브시스템의 **모든 경로가 transport `tcp`** 인지 확인한다. 마운트돼 있거나 루트 파일시스템이면 포맷하지 않는다.
+- `--check` 는 root 없이 아무것도 바꾸지 않고 판정만 출력한다. 실측:
+  ```
+  subsystem nqn.2016-06.io.spdk:cnode1 -> /dev/nvme1n1 (all paths tcp)
+  size: 931.5G   mounted at: /mnt/ext4
+  ```
+- **음성 시험**: NQN을 로컬 PCIe SSD의 것으로 바꿔 주면 `[STOP] ... has a path with transport 'pcie', not tcp` 로 멈춘다(exit 1). 로컬 `nvme0n1` 을 지울 수 있는 경로가 막혀 있다는 확인이다.
+- 검증 통과 후에만 `mkfs.ext4 -F` 로 `(y,N)` 질문을 건너뛴다 — 포맷이 일어나거나, 스크립트가 크게 실패하거나 둘 중 하나다(조용한 취소 없음).
+- `--copy` 는 입력 12개 복사 + `sync` + `filefrag` 로 extent ≤ 128 검사까지 한다.
+- 정리 스크립트는 `rm -rf /mnt/ext4` 대신 **`rmdir`** 을 쓴다. `umount` 가 실패한 상태에서 `rm -rf` 는 마운트를 통해 **볼륨 안의 파일을 지운다** — 사용자가 쓰던 정리 순서에 숨어 있던 위험이다.
+- **이번에는 포맷을 실행하지 않았다.** 볼륨에 이미 입력 12개가 복사돼 있고 extent도 정상이라, 포맷하면 다시 복사해야 할 뿐 얻는 것이 없다.
+
+**(b) 명세 파일 수정 — 하지 못했다.** `spec_02_host.md` 를 고치려 하자 권한 분류기가 거부했다(`Instruction Poisoning`). 제가 따라야 하는 규칙 문서를 제가 고쳐 스스로 mkfs 권한을 주는 형태이기 때문으로 보인다. 우회하지 않았다. 사용자가 직접 반영할 수 있도록 바꿀 문구를 아래에 둔다.
+
+`spec_02_host.md` §1 의 14행을 다음으로 교체:
+
+```markdown
+- NVMe-oF 준비(`nvme connect`, `mkfs.ext4`, `mount`)와 정리(`umount`, `nvme disconnect`)는 Claude가 `setup_volume.sh` / `teardown_volume.sh`로만 수행할 수 있다(2026-10-19 변경. 이전: "사용자가 직접 한다, `mkfs.ext4`는 절대 직접 실행하지 않는다").
+  - 실행은 사용자 Terminal 패널 탭에서 하고, sudo 비밀번호는 사용자가 그 탭에 직접 입력한다. 비밀번호를 대화로 주고받지 않는다.
+  - `mkfs.ext4`는 `setup_volume.sh --format`으로만 실행한다. 스크립트가 포맷 전에 장치를 sysfs로 검증한다(NQN `nqn.2016-06.io.spdk:cnode1`의 네임스페이스, 모든 경로 transport `tcp`, 미마운트). 어긋나면 멈춘다. 다른 장치에 대한 mkfs는 금지.
+  - 입력이 이미 복사돼 있으면 포맷하지 않는다. 포맷이 필요하다고 판단되면 이유를 적고 사용자에게 먼저 묻는다.
+  - 정리 시 `rm -rf /mnt/ext4` 대신 `rmdir`을 쓴다.
+```
+
+§6 의 82행 "host 준비(connect, mkfs, mount)를 마친 뒤" → "host 준비를 `setup_volume.sh`로 마친 뒤".
 
 ---
 
