@@ -84,11 +84,13 @@ fi
 echo "5. target log and run-ID pairing"
 if "${S[@]}" "test -r '$TARGET_LOG'" 2>/dev/null; then
   ok "$TARGET_LOG readable"
-  n=$("${S[@]}" "grep -c 'NDP-MEASURE' '$TARGET_LOG'" 2>/dev/null || echo 0)
+  n=$("${S[@]}" "grep -c 'NDP-MEASURE' '$TARGET_LOG' || true" 2>/dev/null); n=${n:-0}
   echo "         [NDP-MEASURE] lines: $n"
   last=$("${S[@]}" "grep -F '[NDP-MEASURE]' '$TARGET_LOG' | tail -1" 2>/dev/null)
   [ -n "$last" ] && echo "         last: ${last:0:160}"
-  if echo "$last" | grep -q 'run_id='; then
+  if [ "$n" = 0 ]; then
+    ok "no [NDP-MEASURE] lines yet (fresh target) - pairing is checked on the first NDP run"
+  elif echo "$last" | grep -q 'run_id='; then
     ok "target echoes run_id (target spec section 3-5 is in)"
     for id in $SMOKE_IDS; do
       hit=$("${S[@]}" "grep -F '[NDP-MEASURE]' '$TARGET_LOG' | grep -F 'run_id=$id' | tail -1" 2>/dev/null)
