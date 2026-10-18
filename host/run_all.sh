@@ -98,7 +98,9 @@ ENVTXT="$RESULTS/env.txt"
   echo "date: $(date -Is)"
   echo "host: $(hostname)  kernel: $(uname -r)"
   echo "host commit: $(git -C "$(dirname "$0")" log -1 --format='%H %ci %s' 2>/dev/null)"
-  echo "host dirty:  $(git -C "$(dirname "$0")" status --porcelain 2>/dev/null | wc -l) modified paths"
+  # Tracked files only: untracked data directories (labels/, maplogs/, ...)
+  # are always present and would make a clean tree look modified.
+  echo "host dirty:  $(git -C "$(dirname "$0")" status --porcelain --untracked-files=no 2>/dev/null | wc -l) modified tracked files"
   echo "binary: $DARKNET  mtime=$(stat -c %y "$DARKNET")  sha256=$(sha256sum "$DARKNET" | cut -d' ' -f1)"
   echo "weights: $WEIGHTS sha256=$(sha256sum "$WEIGHTS" | cut -d' ' -f1)"
   echo "opencv: $(pkg-config --modversion opencv4 2>/dev/null)"
