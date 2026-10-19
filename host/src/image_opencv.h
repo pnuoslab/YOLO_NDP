@@ -48,6 +48,9 @@ image mat_to_image_cv(mat_cv *mat);
 // NDP: 인메모리 JPEG 버퍼 → darknet image (RGB, CHW, [0,1])
 image ndp_jpeg_to_image(const unsigned char *buf, size_t len);
 image ndp_raw_to_image(const unsigned char *buf, size_t len, int w, int h);
+/* cv::setNumThreads(n) for the NDP host path (-cv_threads); returns
+ * cv::getNumThreads() after the call. n < 0 leaves OpenCV untouched. */
+int ndp_set_cv_threads(int n);
 
 /* Baseline preprocessing breakdown, accumulated inside
  * get_image_from_stream_letterbox(). Seconds, same clock as
@@ -59,7 +62,8 @@ image ndp_raw_to_image(const unsigned char *buf, size_t len, int w, int h);
  *   bl_t_copy      full-resolution cv::Mat copy (cv::resize) + cvtColor()
  *   bl_t_mat2img   mat_to_image() + free_image() of its full-res buffer
  *   bl_t_letterbox letterbox_image()
- * Not covered: the caller's own release_mat() of the in_img copy. */
+ * Not covered: the caller's own release_mat() of the in_img copy, which
+ * validate_video_map() times as part of its cleanup stage. */
 extern double bl_t_decode;
 extern double bl_t_copy;
 extern double bl_t_mat2img;

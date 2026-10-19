@@ -5,6 +5,8 @@
 #   usage: sudo -E ./run_all.sh [E1 E2 E3 E5 ...]      (no arg = all)
 #          sudo -E ./run_all.sh --smoke                 (the 4 checks of
 #                                                        spec 02 section 9)
+#          RESULTS=~/ndp_results/pilot_03b CSV_NAME=results_pilot.csv \
+#            sudo -E ./run_all.sh P3 | L1 L2 C1 D1 D2 K1 K2   (spec 03b-H)
 #
 # Needs root: every run drops the host page cache first.
 # Set TARGET_HOST to have the target's iostat and [NDP-MEASURE] pulled over
@@ -15,6 +17,8 @@
 #   E5  codec        res{1080,2160}_{hevc,av1} BASE/q85          (sws)  sr 1
 #   E2  scene+acc    5 MOT sequences           BASE/q85/q100/raw (sws)  sr 1,2,5
 #   E3  kernel abl.  5 MOT sequences           q85/q100/raw  (darknet)  sr 1
+# Spec 03b-H pilot (section 3 smoke P3, section 4-1 L1..K2), see the pilot
+# block at the end.
 # 3 repeats each, repeats as the OUTERMOST loop so a drifting machine shows
 # up as spread between repeats rather than as a trend inside one condition.
 #
@@ -34,6 +38,9 @@ NVME_MNT=${NVME_MNT:-/mnt/ext4}
 BLOCK_DEV=${BLOCK_DEV:-nvme1n1}
 RESULTS=${RESULTS:-$HOME/ndp_results}
 REPEATS=${REPEATS:-3}
+CSV_NAME=${CSV_NAME:-results.csv}
+HOST_NIC=${HOST_NIC:-enp133s0f0}   # data link 192.168.100.0/30, NVMe/TCP only
+TARGET_NIC=${TARGET_NIC:-ens1f0}
 SLEEP_BETWEEN=${SLEEP_BETWEEN:-3}
 
 TARGET_HOST=${TARGET_HOST:-target-server3}   # ~/.ssh/config alias, <target-lan-ip>:<ssh-port>
@@ -90,7 +97,7 @@ fi
 }
 
 mkdir -p "$RESULTS"/{logs,dumps,io}
-CSV="$RESULTS/results.csv"
+CSV="$RESULTS/$CSV_NAME"
 RUN_BASE=$(( ($(date +%s) % 100000) * 10000 ))
 SEQNO=0
 
@@ -210,6 +217,17 @@ tgt_iostat() {
       "$TARGET_RPC bdev_get_iostat" > "$1" 2>/dev/null || : > "$1"
 }
 
+# Data-link byte counters, "rx tx" on one line. The target's are read over
+# the management LAN, so the ssh itself never shows up in them.
+host_nic() {
+  echo "$(cat /sys/class/net/$HOST_NIC/statistics/rx_bytes 2>/dev/null) $(cat /sys/class/net/$HOST_NIC/statistics/tx_bytes 2>/dev/null)" > "$1"
+}
+tgt_nic() {
+  : > "$1"
+  [ -n "$TARGET_HOST" ] || return 0
+  tssh "echo \$(cat /sys/class/net/$TARGET_NIC/statistics/rx_bytes) \$(cat /sys/class/net/$TARGET_NIC/statistics/tx_bytes)" > "$1" 2>/dev/null || : > "$1"
+}
+
 tgt_measure() {   # $1=outfile $2=run_id
   : > "$1"
   [ -n "$TARGET_HOST" ] || return 0
@@ -218,17 +236,20 @@ tgt_measure() {   # $1=outfile $2=run_id
       > "$1" 2>/dev/null || : > "$1"
 }
 
-# one_run <exp> <input_tag> <video> <labels|-> <pipeline> <kernel> <quality> <sr> <rep> <dump 0|1>
+# one_run <exp> <input_tag> <video> <labels|-> <pipeline> <kernel> <quality> <sr> <rep> <dump 0|1> [extra opts] [stem suffix]
 one_run() {
   local exp=$1 tag=$2 video=$3 labels=$4 pipe=$5 kern=$6 qual=$7 sr=$8 rep=$9 dump=${10}
+  local extra=${11:-} suffix=${12:-}
 
   SEQNO=$((SEQNO + 1))
   local rid=$((RUN_BASE + SEQNO))
-  local stem="${exp}_${tag}_${pipe}_${kern}_sr${sr}_r${rep}"
+  local stem="${exp}_${tag}_${pipe}_${kern}_sr${sr}${suffix}_r${rep}"
   local log="$RESULTS/logs/${stem}.log"
   local sb="$RESULTS/io/${stem}.hstat.before" sa="$RESULTS/io/${stem}.hstat.after"
   local tb="$RESULTS/io/${stem}.tgt.before"   ta="$RESULTS/io/${stem}.tgt.after"
   local tm="$RESULTS/io/${stem}.tgtmeasure"
+  local nb="$RESULTS/io/${stem}.nic.before"   na="$RESULTS/io/${stem}.nic.after"
+  local tnb="$RESULTS/io/${stem}.tnic.before" tna="$RESULTS/io/${stem}.tnic.after"
 
   local -a opts=(-file "$video" -sample_rate "$sr" -label_base 1
                  -points 101 -coco_map -dont_show -run_id "$rid")
@@ -247,19 +268,35 @@ one_run() {
   if [ "$dump" = 1 ]; then
     opts+=(-dump_dets "$RESULTS/dumps/${stem}.csv")
   fi
+  # shellcheck disable=SC2206
+  [ -n "$extra" ] && opts+=($extra)
 
   echo "=== [$SEQNO] $stem run_id=$rid dump=$dump ==="
+
+  echo "[cmd] $DARKNET detector video_map $DATA $CFG $WEIGHTS ${opts[*]}"
 
   drop_caches
   host_stat "$sb"
   tgt_iostat "$tb"
+  tgt_nic "$tnb"
+  host_nic "$nb"
 
-  local status=$OK_STATUS
-  if ! "$DARKNET" detector video_map "$DATA" "$CFG" "$WEIGHTS" \
-        "${opts[@]}" > "$log" 2>&1; then
-    status=fail_exit
-  fi
+  # The detector runs in the background so a watcher can sample its thread
+  # count once a second (/proc/<pid>/status Threads); the peak goes into the
+  # row. The watcher only reads one procfs file per second.
+  local status=$OK_STATUS thr_peak=0 t
+  "$DARKNET" detector video_map "$DATA" "$CFG" "$WEIGHTS" \
+        "${opts[@]}" > "$log" 2>&1 &
+  local dpid=$!
+  while kill -0 "$dpid" 2>/dev/null; do
+    t=$(awk '/^Threads:/{print $2}' "/proc/$dpid/status" 2>/dev/null)
+    [ -n "$t" ] && [ "$t" -gt "$thr_peak" ] && thr_peak=$t
+    sleep 1
+  done
+  wait "$dpid" || status=fail_exit
 
+  host_nic "$na"
+  tgt_nic "$tna"
   host_stat "$sa"
   tgt_iostat "$ta"
   tgt_measure "$tm" "$rid"
@@ -271,7 +308,10 @@ one_run() {
       --log "$log" --tgt-measure "$tm" \
       --host-stat-before "$sb" --host-stat-after "$sa" \
       --tgt-iostat-before "$tb" --tgt-iostat-after "$ta" \
-      --tgt-bdev "$TARGET_BDEV"
+      --tgt-bdev "$TARGET_BDEV" \
+      --nic-before "$nb" --nic-after "$na" \
+      --tgt-nic-before "$tnb" --tgt-nic-after "$tna" \
+      --host-thr-peak "$thr_peak" --extra-opts "$extra"
 
   sleep "$SLEEP_BETWEEN"
 }
@@ -298,6 +338,66 @@ if [ "$SMOKE" = 1 ]; then
   V="$NVME_MNT/res1080_av1.mp4"
   have "$V" && one_run E5 res1080_av1 "$V" - q85 sws 85 1 1 0
   echo "### smoke done: $CSV ###"
+  exit 0
+fi
+
+# ── spec 03b-H: section 3 smoke (P3) and section 4-1 pilot ───────────
+# Perf runs pass -post_thresh 0.25 explicitly (also the default) so the
+# command line in the log says what the post-processing did. Repeats are
+# the outermost loop; conditions with 3 repeats run in repeats 1-3, K2
+# (one accuracy run per pipeline) in repeat 1.
+PILOT_STEPS="P3 L1 L2 C1 D1 D2 K1 K2"
+is_pilot=0
+for s in "${STEPS[@]:-}"; do case " $PILOT_STEPS " in *" $s "*) is_pilot=1 ;; esac; done
+if [ "$is_pilot" = 1 ]; then
+  PT="-post_thresh 0.25"
+  M=$NVME_MNT
+  if do_step P3; then
+    one_run P3 res1080_h264 "$M/res1080_h264.mp4" - BASE sws -  1 1 0 "$PT"
+    one_run P3 res1080_h264 "$M/res1080_h264.mp4" - q85  sws 85 1 1 0 "$PT"
+  fi
+  for rep in 1 2 3 4 5; do
+    if do_step L1; then
+      for r in 1080 2160; do
+        V="$M/res${r}_h264.mp4"
+        one_run L1 "res${r}_h264" "$V" - BASE sws -   1 "$rep" 0 "$PT"
+        one_run L1 "res${r}_h264" "$V" - q85  sws 85  1 "$rep" 0 "$PT"
+        one_run L1 "res${r}_h264" "$V" - raw  sws raw 1 "$rep" 0 "$PT"
+      done
+    fi
+    [ "$rep" -le 3 ] || continue
+    if do_step L2; then
+      one_run L2 res2160_h264 "$M/res2160_h264.mp4" - q85 sws 85 5 "$rep" 0 "$PT"
+    fi
+    if do_step C1; then
+      for r in 1080 2160; do
+        one_run C1 "res${r}_h264" "$M/res${r}_h264.mp4" - q85 sws 85 1 "$rep" 0 "$PT -cv_threads 1" _ct1
+      done
+    fi
+    if do_step D1; then
+      for r in 1080 2160; do
+        one_run D1 "res${r}_av1" "$M/res${r}_av1.mp4" - q85 sws 85 1 "$rep" 0 "$PT -dec_threads 14" _dt14
+      done
+    fi
+    if do_step D2; then
+      for f in res2160_h264 res2160_hevc; do
+        one_run D2 "$f" "$M/$f.mp4" - q85 sws 85 1 "$rep" 0 "$PT -dec_threads 14" _dt14
+      done
+    fi
+    if do_step K1; then
+      for q in q85:85 q100:100 raw:raw; do
+        one_run K1 res2160_h264 "$M/res2160_h264.mp4" - "${q%%:*}" darknet "${q##*:}" 1 "$rep" 0 "$PT"
+      done
+    fi
+    if [ "$rep" = 1 ] && do_step K2; then
+      one_run K2 MOT17-04 "$M/MOT17-04.mp4" labels/MOT17-04 BASE sws -  1 1 1
+      one_run K2 MOT17-04 "$M/MOT17-04.mp4" labels/MOT17-04 q85  sws 85 1 1 1
+    fi
+  done
+  echo
+  echo "runs: $SEQNO"
+  echo "results: $CSV"
+  echo "env:     $ENVTXT"
   exit 0
 fi
 

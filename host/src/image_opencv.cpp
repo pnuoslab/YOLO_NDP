@@ -397,6 +397,12 @@ image ndp_raw_to_image(const unsigned char *buf, size_t len,
     return im;
 }
 
+extern "C" int ndp_set_cv_threads(int n)
+{
+    if (n >= 0) cv::setNumThreads(n);
+    return cv::getNumThreads();
+}
+
 // ====================================================================
 // Window
 // ====================================================================

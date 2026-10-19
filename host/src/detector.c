@@ -58,6 +58,7 @@ static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out);
 static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
                          int sample_rate, int jpeg_quality, int chroma_444,
                          int darknet_kernel, uint32_t run_id,
+                         uint32_t dec_threads,
                          uint32_t *total_result_size_out);
 static int ndp_send_0xc2(int nvme_fd, void *buf, uint32_t total_bytes);
 
@@ -1221,6 +1222,41 @@ static double vmap_cpu_total(void)
     return u + sy;
 }
 
+/* Process CPU time (utime + stime, all threads) from /proc/self/stat, as an
+ * independent cross-check of getrusage(). Clock-tick resolution (10 ms). */
+static double vmap_procstat_cpu(void)
+{
+    char buf[1024];
+    FILE *f = fopen("/proc/self/stat", "r");
+    if (!f) return -1.0;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    /* comm (field 2) may contain spaces; count fields after its ')' */
+    char *p = strrchr(buf, ')');
+    if (!p) return -1.0;
+    unsigned long long ut = 0, st = 0;
+    if (sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu",
+               &ut, &st) != 2)
+        return -1.0;
+    return (double)(ut + st) / (double)sysconf(_SC_CLK_TCK);
+}
+
+/* One numeric field ("VmHWM:", "Threads:") from /proc/self/status, -1 if
+ * missing. VmHWM is in kB. */
+static long vmap_status_field(const char *key)
+{
+    char line[256];
+    long v = -1;
+    size_t kl = strlen(key);
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    while (fgets(line, sizeof(line), f))
+        if (!strncmp(line, key, kl)) { v = strtol(line + kl, NULL, 10); break; }
+    fclose(f);
+    return v;
+}
+
 float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
                          char *video_path, char *label_dir, char *nvme_dev,
                          int use_ndp, int sample_rate, int label_base,
@@ -1228,7 +1264,9 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
                          const int map_points, int coco_range,
                          int jpeg_quality, int chroma_444, int darknet_kernel,
                          char *save_img_dir, char *save_log_path,
-                         char *dump_dets_path, uint32_t run_id)
+                         char *dump_dets_path, uint32_t run_id,
+                         float post_thresh, int cv_threads,
+                         uint32_t dec_threads)
 {
     int i, j;
  
@@ -1266,14 +1304,58 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     const int classes = l.classes;
     if (classes != names_size)
         fprintf(stderr, "[MAP] Warning: cfg classes=%d but names=%d\n", classes, names_size);
- 
-    /* ---- source geometry ---- */
+
+    /* OpenCV's thread pool on the NDP host path only (JPEG decode, colour
+     * conversion). The baseline keeps darknet's standard behaviour. */
+    int cv_threads_eff = -1;
+    if (use_ndp && cv_threads >= 0)
+        cv_threads_eff = ndp_set_cv_threads(cv_threads);
+
+    /* GPU warm-up, identical for both pipelines and outside e2e: the first
+     * forward passes carry cuDNN algorithm selection and lazy allocations
+     * that would otherwise land in the first frame's inference time. */
+    double t_warmup = what_time_is_it_now();
+    {
+        image dummy = make_image(net.w, net.h, net.c);
+        for (i = 0; i < 3; ++i) network_predict(net, dummy.data);
+        free_image(dummy);
+    }
+    t_warmup = what_time_is_it_now() - t_warmup;
+
+    /* Latency accounting. e2e opens immediately before the first piece of
+     * work done for this clip: the container open/probe for the baseline,
+     * FIEMAP + 0xC0 for NDP. It closes after the last frame's cleanup.
+     * Model loading, warm-up, the mAP pass and the dump sit outside it.
+     * Every stretch inside it is timed, so e2e - (sum of stages) is only
+     * timer and loop-control overhead:
+     *   bl_open   baseline: get_capture_video_stream() + property reads
+     *   target_pre / io   NDP: 0xC0 round trip / 0xC2 transfer
+     *   setup     everything else between e2e start and the first frame
+     *   pre       per-frame pixel work up to the network input
+     *   infer     network_predict()
+     *   post      get_network_boxes() + NMS
+     *   eval      label read, mAP bookkeeping, logs, progress line
+     *   cleanup   per-frame frees (detections, labels, image, in_img) */
+    double t_e2e_start = 0.0, t_e2e = 0.0;
+    double t_c0 = 0.0, t_io = 0.0, t_pre = 0.0, t_infer = 0.0;
+    double t_bl_open = 0.0, t_meta_open = 0.0, t_setup = 0.0;
+    double t_post = 0.0, t_eval = 0.0, t_cleanup = 0.0;
+
+    /* ---- source geometry ----
+     * The baseline needs this open to read the video, so it is the start of
+     * its e2e. NDP opens it only to learn the source resolution and frame
+     * count, which the target could report itself; that open is timed
+     * separately (ndp_meta_open) and kept outside e2e. */
+    if (!use_ndp) t_e2e_start = what_time_is_it_now();
+    double t_open0 = what_time_is_it_now();
     cap_cv *cap = get_capture_video_stream(video_path);
     if (!cap) { fprintf(stderr, "[MAP] Cannot open video: %s\n", video_path); return 0; }
  
     int orig_w = (int)get_capture_property_cv(cap, VMAP_CAP_PROP_FRAME_WIDTH);
     int orig_h = (int)get_capture_property_cv(cap, VMAP_CAP_PROP_FRAME_HEIGHT);
     int total_frames = (int)get_capture_frame_count_cv(cap);
+    if (use_ndp) t_meta_open = what_time_is_it_now() - t_open0;
+    else         t_bl_open   = what_time_is_it_now() - t_open0;
     if (orig_w <= 0 || orig_h <= 0) {
         fprintf(stderr, "[MAP] Invalid video dimensions (%dx%d)\n", orig_w, orig_h);
         release_capture(cap);
@@ -1314,17 +1396,11 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     uint32_t  num_ndp_frames   = 0;
     size_t    blob_off         = 0;
 
-    /* Latency accounting. The e2e window opens just before the 0xC0 command
-     * and closes after the last inference: model loading and the mAP pass sit
-     * outside it, because neither is part of the pipeline being compared.
-     * t_io is the storage-to-host transfer, t_pre is every pixel operation
-     * (target-side for NDP, host-side for the baseline), t_infer is the
-     * network forward pass. */
-    double t_e2e_start = 0.0, t_e2e = 0.0;
-    double t_c0 = 0.0, t_io = 0.0, t_pre = 0.0, t_infer = 0.0;
     /* CPU time, not wall time. Read outside each wall-clock window so the
      * getrusage() cost never lands inside t_pre / t_infer. */
     double t_cpu_pre = 0.0, t_cpu_infer = 0.0;
+    double t_cpu_post = 0.0, t_cpu_eval = 0.0, t_cpu_cleanup = 0.0;
+    double procstat_start = 0.0, procstat_loop = 0.0;
     double cpu_user_start = 0.0, cpu_sys_start = 0.0;
     double cpu_user_loop  = 0.0, cpu_sys_loop  = 0.0;
     uint64_t transfer_bytes = 0;
@@ -1344,7 +1420,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         double t0 = what_time_is_it_now();
         if (ndp_send_0xc0(nvme_fd, video_path, sample_rate,
                           jpeg_quality, chroma_444, darknet_kernel, run_id,
-                          &total_result_size) < 0 ||
+                          dec_threads, &total_result_size) < 0 ||
             total_result_size == 0) {
             fprintf(stderr, "[MAP] 0xC0 failed\n");
             close(nvme_fd); release_capture(cap); return 0;
@@ -1413,9 +1489,12 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
  
     /* ---- accumulators ---- */
  
-    /* Fixed low threshold: AP integration needs the low-confidence tail of the
-     * PR curve, so this must not be replaced by the user-facing -thresh. */
-    const float thresh = .005f;
+    /* Accuracy runs keep the fixed low threshold: AP integration needs the
+     * low-confidence tail of the PR curve. A performance run (no labels, no
+     * dump) does the post-processing a deployment would do, at the
+     * deployment confidence floor -post_thresh. */
+    const int do_eval = !perf_only || dump_dets_path || save_log_path || save_img_dir;
+    const float thresh = do_eval ? .005f : post_thresh;
     const float nms    = .45f;
  
     int cap_dets = 4096;
@@ -1475,7 +1554,6 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
             transfer_bytes = (uint64_t)st.st_size;
             if (total_frames > 0) frame_avg = (double)st.st_size / total_frames;
         }
-        t_e2e_start = what_time_is_it_now();
     }
 
     time_t start = time(0);
@@ -1484,12 +1562,15 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
      * before the loop so they cover exactly the same work as t_pre/t_infer. */
     bl_timers_reset();
     vmap_cpu_times(&cpu_user_start, &cpu_sys_start);
+    procstat_start = vmap_procstat_cpu();
+    t_setup = what_time_is_it_now() - t_e2e_start - t_bl_open - t_c0 - t_io;
  
     /* ---- frame loop ---- */
     int decode_idx = 0;
     for (;;) {
         image im_input;
         im_input.data = NULL; im_input.w = 0; im_input.h = 0; im_input.c = 0;
+        mat_cv *in_img = NULL;   /* baseline: full-resolution copy, freed in cleanup */
  
         double c_stage = vmap_cpu_total();
         double t_stage = what_time_is_it_now();
@@ -1509,19 +1590,26 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         } else {
             /* Same pixel operations as validate_detector_map()'s
              * LETTERBOX_DATA path; only the source differs. */
-            mat_cv *in_img = NULL;
+            in_img = NULL;
             im_input = get_image_from_stream_letterbox(cap, net.w, net.h,
                                                        net.c, &in_img, 0);
-            if (in_img) release_mat(&in_img);
-            if (!im_input.data || im_input.w == 0) break;
         }
         t_pre += what_time_is_it_now() - t_stage;
         t_cpu_pre += vmap_cpu_total() - c_stage;
+        if (!use_ndp && (!im_input.data || im_input.w == 0)) {
+            c_stage = vmap_cpu_total();
+            t_stage = what_time_is_it_now();
+            if (in_img) release_mat(&in_img);
+            t_cleanup += what_time_is_it_now() - t_stage;
+            t_cpu_cleanup += vmap_cpu_total() - c_stage;
+            break;
+        }
  
         if (!im_input.data || im_input.w != net.w || im_input.h != net.h) {
             fprintf(stderr, "[MAP] frame %d: bad image (%dx%d), skipped\n",
                     decode_idx, im_input.w, im_input.h);
             if (im_input.data) free_image(im_input);
+            if (in_img) release_mat(&in_img);
             ++image_index;
             if (!use_ndp) {
                 for (i = 1; i < sample_rate; ++i) consume_frame(cap);
@@ -1538,6 +1626,8 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         t_cpu_infer += vmap_cpu_total() - c_stage;
  
         int nboxes = 0;
+        c_stage = vmap_cpu_total();
+        t_stage = what_time_is_it_now();
         /* Passing the source resolution rather than the 416x416 input size
          * makes correct_yolo_boxes() undo the letterbox transform, so boxes
          * come back in source-frame normalised coordinates and can be matched
@@ -1548,7 +1638,11 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
             if (l.nms_kind == DEFAULT_NMS) do_nms_sort(dets, nboxes, l.classes, nms);
             else diounms_sort(dets, nboxes, l.classes, nms, l.nms_kind, l.beta_nms);
         }
- 
+        t_post += what_time_is_it_now() - t_stage;
+        t_cpu_post += vmap_cpu_total() - c_stage;
+
+        c_stage = vmap_cpu_total();
+        t_stage = what_time_is_it_now();
         char labelpath[4096];
         int num_labels = 0;
         box_label *truth = NULL;
@@ -1564,7 +1658,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
  
         const int checkpoint = ndets;
  
-        for (i = 0; i < nboxes; ++i) {
+        for (i = 0; i < (do_eval ? nboxes : 0); ++i) {
             int class_id;
             for (class_id = 0; class_id < classes; ++class_id) {
                 float prob = dets[i].prob[class_id];
@@ -1647,15 +1741,29 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         if ((image_index % 50) == 0)
             fprintf(stderr, "\r[MAP] eval frame %d (video idx %d)   ",
                     image_index, decode_idx);
- 
+        t_eval += what_time_is_it_now() - t_stage;
+        t_cpu_eval += vmap_cpu_total() - c_stage;
+
+        c_stage = vmap_cpu_total();
+        t_stage = what_time_is_it_now();
         free_detections(dets, nboxes);
         free(truth);
         free_image(im_input);
+        if (in_img) release_mat(&in_img);
+        t_cleanup += what_time_is_it_now() - t_stage;
+        t_cpu_cleanup += vmap_cpu_total() - c_stage;
  
         ++image_index;
  
-        if (!use_ndp) {
+        if (!use_ndp && sample_rate > 1) {
+            /* Skipped frames still have to be decoded: part of pre. */
+            c_stage = vmap_cpu_total();
+            t_stage = what_time_is_it_now();
             for (i = 1; i < sample_rate; ++i) consume_frame(cap);
+            t_pre += what_time_is_it_now() - t_stage;
+            t_cpu_pre += vmap_cpu_total() - c_stage;
+        }
+        if (!use_ndp) {
             decode_idx += sample_rate;
             if (total_frames > 0 && decode_idx >= total_frames) break;
         }
@@ -1668,6 +1776,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         vmap_cpu_times(&u, &sy);
         cpu_user_loop = u - cpu_user_start;
         cpu_sys_loop  = sy - cpu_sys_start;
+        procstat_loop = vmap_procstat_cpu() - procstat_start;
     }
 
     const int num_eval_frames = image_index;
@@ -1832,13 +1941,21 @@ measure_only:
     {
         struct rusage ru;
         getrusage(RUSAGE_SELF, &ru);
+        const double stage_sum = t_bl_open + t_c0 + t_io + t_setup + t_pre
+                               + t_infer + t_post + t_eval + t_cleanup;
         printf("[MEASURE] mode=%s q=%d chroma=%s resize=%s frames=%d "
                "e2e=%.3f target_pre=%.3f io=%.3f host_pre=%.3f infer=%.3f "
                "bytes=%llu frame_min=%u frame_avg=%.1f frame_max=%u "
                "host_rss_mb=%.1f host_blob_mb=%.1f ap50=%.4f ap5095=%.4f "
                "run_id=%u bl_decode_s=%.3f bl_copy_s=%.3f bl_mat2img_s=%.3f "
                "bl_letterbox_s=%.3f host_cpu_user_s=%.3f host_cpu_sys_s=%.3f "
-               "host_cpu_pre_s=%.3f host_cpu_infer_s=%.3f\n",
+               "host_cpu_pre_s=%.3f host_cpu_infer_s=%.3f "
+               "post_thresh=%.3f cv_threads=%d dec_threads_req=%u "
+               "warmup_s=%.3f ndp_meta_open_s=%.3f bl_open_s=%.3f setup_s=%.3f "
+               "post_s=%.3f eval_s=%.3f cleanup_s=%.3f stage_sum_s=%.3f "
+               "resid_pct=%.3f host_cpu_post_s=%.3f host_cpu_eval_s=%.3f "
+               "host_cpu_cleanup_s=%.3f host_cpu_procstat_s=%.3f "
+               "host_maxrss_mb=%.1f host_vmhwm_mb=%.1f host_threads_end=%ld\n",
                use_ndp ? "ndp" : "baseline",
                use_ndp ? (jpeg_quality ? jpeg_quality : 85) : -1,
                !use_ndp || jpeg_quality == NDP_JPEG_Q_RAW ? "-"
@@ -1867,7 +1984,25 @@ measure_only:
                 * whichever stage happens to be running. The inference figure
                 * also includes CUDA's synchronisation spin-wait, which is
                 * left at its default setting on purpose. */
-               cpu_user_loop, cpu_sys_loop, t_cpu_pre, t_cpu_infer);
+               cpu_user_loop, cpu_sys_loop, t_cpu_pre, t_cpu_infer,
+               /* 03b additions. stage_sum covers every timed stretch of the
+                * e2e window; resid_pct = (e2e - stage_sum) / e2e * 100 is the
+                * untimed loop-control and timer overhead. post_thresh is the
+                * confidence floor actually used for get_network_boxes()
+                * (0.005 whenever labels, a dump or a log is requested).
+                * cv_threads is cv::getNumThreads() after -cv_threads, -1 if
+                * OpenCV was left untouched. host_cpu_procstat_s is the loop's
+                * CPU from /proc/self/stat (10 ms ticks), to cross-check
+                * host_cpu_user_s + host_cpu_sys_s. Both RSS figures are host
+                * memory only: GPU memory is not included. */
+               thresh, cv_threads_eff, dec_threads,
+               t_warmup, t_meta_open, t_bl_open, t_setup,
+               t_post, t_eval, t_cleanup, stage_sum,
+               t_e2e > 0 ? 100.0 * (t_e2e - stage_sum) / t_e2e : 0.0,
+               t_cpu_post, t_cpu_eval, t_cpu_cleanup, procstat_loop,
+               (double)ru.ru_maxrss / 1024.0,
+               (double)vmap_status_field("VmHWM:") / 1024.0,
+               vmap_status_field("Threads:"));
     }
  
 cleanup:
@@ -2985,6 +3120,8 @@ static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out)
  * cdw13   : opaque 32-bit run ID, echoed by the target into its own
  *           [NDP-MEASURE] line so host rows and target rows can be paired
  *           without relying on timestamps. 0 means "not set".
+ * cdw14   : decoder thread count for the target's libavcodec context.
+ *           0 keeps the target default (thread_count = 0, auto).
  * cdw0    : (response) total byte size of the result buffer
  *
  * The ioctl blocks until the target's worker thread has finished the entire
@@ -2996,6 +3133,7 @@ static int ndp_get_extents(const char *filepath, ndp_extent_table_t *out)
 static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
                          int sample_rate, int jpeg_quality, int chroma_444,
                          int darknet_kernel, uint32_t run_id,
+                         uint32_t dec_threads,
                          uint32_t *total_result_size_out)
 {
     ndp_extent_table_t ext = {0};
@@ -3037,15 +3175,18 @@ static int ndp_send_0xc0(int nvme_fd, const char *mp4_path,
         .cdw11      = (uint32_t)(sample_rate  & 0xFFFF),
         .cdw12      = cdw12,
         .cdw13      = run_id,
+        .cdw14      = dec_threads,
         .timeout_ms = NDP_NVME_TIMEOUT_MS,
     };
  
     printf("[NDP] Sending 0xC0 (data_len=%zu, cdw10=%u, sample_rate=1/%d, "
-           "jpeg_q=%d, chroma=%s, resize=%s, cdw12=0x%08x, run_id=%u) ...\n",
+           "jpeg_q=%d, chroma=%s, resize=%s, cdw12=0x%08x, run_id=%u, "
+           "dec_threads=%u) ...\n",
            buf_bytes, ext.count, sample_rate,
            jpeg_quality ? jpeg_quality : 85,
            chroma_444 ? "4:4:4" : "4:2:0",
-           darknet_kernel ? "darknet" : "swscale", cdw12, run_id);
+           darknet_kernel ? "darknet" : "swscale", cdw12, run_id,
+           dec_threads);
     fflush(stdout);
  
     int ret = ioctl(nvme_fd, NVME_IOCTL_IO_CMD, &cmd);
@@ -3165,7 +3306,7 @@ void ndp_test_detector(char *datacfg, char *cfgfile, char *weightfile,
      *   ([uint32 frame_count][uint32 jpeg_size × N][JPEG blob × N])
      */
     uint32_t total_result_size = 0;
-      if (ndp_send_0xc0(nvme_fd, mp4_path, ndp_sample_rate, 0, 0, 0, 0,
+      if (ndp_send_0xc0(nvme_fd, mp4_path, ndp_sample_rate, 0, 0, 0, 0, 0,
                         &total_result_size) < 0)
         goto cleanup_fd;
  
@@ -3443,6 +3584,13 @@ static void ndp_print_usage(const char *prog)
 "  -run_id <n>         32-bit tag for this run. Forwarded to the target in\n"
 "                      cdw13 and printed as run_id= in [MEASURE], so host\n"
 "                      and target rows can be paired without timestamps.\n"
+"  -post_thresh <f>    confidence floor for get_network_boxes() in a\n"
+"                      performance run (default 0.25). Accuracy runs (-labels,\n"
+"                      -dump_dets) always use 0.005.\n"
+"  -cv_threads <n>     NDP only: cv::setNumThreads(n) for the host JPEG path.\n"
+"                      Default -1 leaves OpenCV untouched.\n"
+"  -dec_threads <n>    NDP only: target decoder threads, sent in cdw14.\n"
+"                      0 (default) keeps the target's auto setting.\n"
 "\n"
 "Examples\n"
 "  # A: host baseline, every frame\n"
@@ -3580,6 +3728,16 @@ void run_detector(int argc, char **argv)
          * [MEASURE], so a host row and a target row can be paired without
          * relying on wall-clock timestamps. */
         uint32_t run_id   = (uint32_t)find_int_arg(argc, argv, "-run_id", 0);
+        /* Confidence floor for post-processing in a performance run. */
+        float post_thresh = find_float_arg(argc, argv, "-post_thresh", .25f);
+        /* NDP host path only: cv::setNumThreads(n). -1 = leave OpenCV alone. */
+        int   cv_threads  = find_int_arg(argc, argv, "-cv_threads", -1);
+        /* Target decoder threads via cdw14. 0 = target default (auto). */
+        int   dec_threads = find_int_arg(argc, argv, "-dec_threads", 0);
+        if (dec_threads < 0) {
+            fprintf(stderr, "[MAP] -dec_threads must be >= 0 (got %d)\n", dec_threads);
+            return;
+        }
         int   use_ndp     = find_arg(argc, argv, "-ndp");
         int   sample_rate = find_int_arg(argc, argv, "-sample_rate", 1);
         int   label_base  = find_int_arg(argc, argv, "-label_base", 1);
@@ -3620,7 +3778,8 @@ void run_detector(int argc, char **argv)
                            nvme_dev, use_ndp, sample_rate, label_base,
                            thresh, iou_thresh, map_points, coco_range,
                            jpeg_q, chroma_444, darknet_kernel,
-                           save_img, save_log, dump_dets, run_id);
+                           save_img, save_log, dump_dets, run_id,
+                           post_thresh, cv_threads, (uint32_t)dec_threads);
     }
     else if (0 == strcmp(argv[2], "demo")) {
         list *options = read_data_cfg(datacfg);

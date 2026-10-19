@@ -29,12 +29,21 @@ MEASURE_FIELDS = [
     "run_id",
     "bl_decode_s", "bl_copy_s", "bl_mat2img_s", "bl_letterbox_s",
     "host_cpu_user_s", "host_cpu_sys_s", "host_cpu_pre_s", "host_cpu_infer_s",
+    # spec 03b-H section 2
+    "post_thresh", "cv_threads", "dec_threads_req",
+    "warmup_s", "ndp_meta_open_s", "bl_open_s", "setup_s",
+    "post_s", "eval_s", "cleanup_s", "stage_sum_s", "resid_pct",
+    "host_cpu_post_s", "host_cpu_eval_s", "host_cpu_cleanup_s",
+    "host_cpu_procstat_s", "host_maxrss_mb", "host_vmhwm_mb", "host_threads_end",
 ]
 
 COND_FIELDS = ["exp", "input", "pipeline", "kernel", "quality",
                "sample_rate", "rep", "run_id_req", "dump", "status"]
 
-HOST_IO_FIELDS = ["host_read_bytes", "host_write_bytes", "host_io_ticks_ms"]
+HOST_IO_FIELDS = ["host_read_bytes", "host_write_bytes", "host_io_ticks_ms",
+                  "host_nic_rx_bytes", "host_nic_tx_bytes",
+                  "tgt_nic_rx_bytes", "tgt_nic_tx_bytes",
+                  "host_thr_peak", "extra_opts"]
 
 TGT_IO_FIELDS = ["tgt_bytes_read", "tgt_bytes_written",
                  "tgt_num_read_ops", "tgt_num_write_ops"]
@@ -98,6 +107,19 @@ def blockstat_delta(before, after):
     }
 
 
+def nic_delta(before, after, prefix):
+    """'rx tx' byte counters before/after -> deltas."""
+    def load(p):
+        if not p or not os.path.isfile(p):
+            return None
+        parts = open(p).read().split()
+        return [int(x) for x in parts] if len(parts) == 2 else None
+    b, a = load(before), load(after)
+    if not b or not a:
+        return {}
+    return {prefix + "rx_bytes": a[0] - b[0], prefix + "tx_bytes": a[1] - b[1]}
+
+
 def iostat_delta(before, after, bdev=None):
     """SPDK bdev_get_iostat deltas.
 
@@ -147,6 +169,12 @@ def main():
     ap.add_argument("--tgt-iostat-before", default="")
     ap.add_argument("--tgt-iostat-after", default="")
     ap.add_argument("--tgt-bdev", default="")
+    ap.add_argument("--nic-before", default="")
+    ap.add_argument("--nic-after", default="")
+    ap.add_argument("--tgt-nic-before", default="")
+    ap.add_argument("--tgt-nic-after", default="")
+    ap.add_argument("--host-thr-peak", default="")
+    ap.add_argument("--extra-opts", default="")
     ap.add_argument("--csv", required=True)
     args = ap.parse_args()
 
@@ -159,6 +187,10 @@ def main():
     row.update(blockstat_delta(args.host_stat_before, args.host_stat_after))
     row.update(iostat_delta(args.tgt_iostat_before, args.tgt_iostat_after,
                             args.tgt_bdev or None))
+    row.update(nic_delta(args.nic_before, args.nic_after, "host_nic_"))
+    row.update(nic_delta(args.tgt_nic_before, args.tgt_nic_after, "tgt_nic_"))
+    row["host_thr_peak"] = args.host_thr_peak
+    row["extra_opts"] = args.extra_opts
 
     tgt = read_measure(args.tgt_measure, "[NDP-MEASURE]")
     extra = {}
