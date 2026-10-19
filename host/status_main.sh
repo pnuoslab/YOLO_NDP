@@ -12,7 +12,7 @@ R=${RESULTS:-/home/${SUDO_USER:-$USER}/ndp_results/main}
 TARGET_HOST=${TARGET_HOST:-target-server3}
 
 echo "── processes ──"
-run=$(pgrep -af '^bash \./run_all\.sh' || true)
+run=$(pgrep -af '^bash (\./|/[^ ]*/)run_all\.sh' || true)
 echo "  running: ${run:-none}"
 if pgrep -f 'previous block finished' >/dev/null; then
   echo "  queued:  $(ls -t "$R"/queue_*.log 2>/dev/null | head -1 | sed 's/.*queue_//; s/_[0-9]*_[0-9]*\.log//; s/_/ /g') (waits for the running block)"
