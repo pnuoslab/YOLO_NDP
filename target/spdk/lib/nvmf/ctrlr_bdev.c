@@ -27,6 +27,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <malloc.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -138,6 +139,22 @@ ndp_read_thread_cpu(void)
 		return -1.0;
 	}
 	return (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
+}
+
+/*
+ * Bytes currently allocated through malloc across all arenas, including
+ * chunks served by separate mmaps. Unlike VmRSS this does not include freed
+ * memory that glibc keeps resident in per-thread arenas, so a delta of it
+ * does not depend on what earlier requests left behind. mallinfo2() takes
+ * each arena's lock in turn; about 1 ms here, and only called outside the
+ * per-frame loop.
+ */
+static size_t
+ndp_heap_inuse_bytes(void)
+{
+	struct mallinfo2 mi = mallinfo2();
+
+	return mi.uordblks + mi.hblkhd;
 }
 
 /*
@@ -1349,6 +1366,7 @@ struct ndp_request_ctx {
     double   cpu_reactor_start;       /* reactor thread CPU at 0xC0 entry */
     long     rss_entry_kb;            /* VmRSS at 0xC0 entry, after peak reset */
     long     thr_base;                /* process Threads at 0xC0 entry */
+    size_t   heap_inuse_entry;        /* malloc bytes in use at 0xC0 entry */
     bool     peak_rss_reset_ok;
 };
 
@@ -1654,6 +1672,7 @@ struct ndp_offload_ctx {
     const char *m_dec_name;       /* AVCodec->name actually selected; static string */
     int       m_dec_threads_set;  /* codec_ctx->thread_count after avcodec_open2 */
     long      m_thr_peak;         /* max of process Threads before/after the loop */
+    size_t    m_heap_inuse_end;   /* malloc bytes in use right after the loop */
 };
 
 static void
@@ -1725,6 +1744,19 @@ preprocess_done_on_spdk_thread(void *arg)
                 (heap_peak_delta_mb >= 0.0)
                 ? dma_readbuf_mb + dma_blob_mb + heap_peak_delta_mb : -1.0;
 
+            /*
+             * Allocation-based counterpart of the two figures above.
+             * heap_peak_delta_mb is VmHWM minus the VmRSS at entry, and that
+             * entry baseline includes freed memory earlier requests left
+             * resident in per-thread arenas, which this request then reuses
+             * without growing RSS - so it varies with request order.
+             * heap_inuse_mb counts what this request actually holds and does
+             * not. Signed: the reactor may free memory concurrently.
+             */
+            double heap_inuse_mb =
+                ((double)off->m_heap_inuse_end - (double)mctx->heap_inuse_entry) / (1024.0 * 1024.0);
+            double storage_mem_alloc_mb = dma_readbuf_mb + dma_blob_mb + heap_inuse_mb;
+
             SPDK_NOTICELOG("[NDP-MEASURE] run_id=%u q=%d chroma=%s resize=%s sample_rate=%d "
                            "frames=%d sampled=%d decode=%.3f letterbox=%.3f "
                            "encode=%.3f pre_total=%.3f bytes=%u frame_avg=%.1f "
@@ -1735,7 +1767,8 @@ preprocess_done_on_spdk_thread(void *arg)
                            "dma_readbuf_mb=%.1f dma_blob_mb=%.1f heap_peak_delta_mb=%.1f "
                            "storage_mem_total_mb=%.1f "
                            "dec_name=%s dec_threads_req=%u dec_threads_set=%d "
-                           "thr_peak=%ld thr_base=%ld\n",
+                           "thr_peak=%ld thr_base=%ld "
+                           "heap_inuse_mb=%.1f storage_mem_alloc_mb=%.1f\n",
                            mctx->run_id,
                            off->m_jpeg_q,
                            off->m_jpeg_q < 0 ? "-" : (off->m_chroma_444 ? "444" : "420"),
@@ -1755,7 +1788,8 @@ preprocess_done_on_spdk_thread(void *arg)
                            storage_mem_total_mb,
                            off->m_dec_name ? off->m_dec_name : "-",
                            mctx->dec_threads_req, off->m_dec_threads_set,
-                           off->m_thr_peak, mctx->thr_base);
+                           off->m_thr_peak, mctx->thr_base,
+                           heap_inuse_mb, storage_mem_alloc_mb);
         }
     } else {
         /* Worker reported failure */
@@ -2039,6 +2073,15 @@ ndp_preprocess_worker(void *arg)
     {
         long thr_after_loop = ndp_proc_status_kb("Threads:");
         off->m_thr_peak = thr_before_loop > thr_after_loop ? thr_before_loop : thr_after_loop;
+
+        /*
+         * Heap held by this request at the end of the loop: every payload is
+         * still alive and the decoder has not been freed yet. Per-frame
+         * scratch buffers (letterbox, swscale/darknet conversion, libjpeg
+         * work memory) are already released by now, so this is a lower bound
+         * on the true peak by roughly one frame's scratch.
+         */
+        off->m_heap_inuse_end = ndp_heap_inuse_bytes();
     }
  
     SPDK_NOTICELOG("[NDP-verify] decoded_frames=%d  sampled_count=%d  "
@@ -2372,6 +2415,7 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
     ctx->peak_rss_reset_ok = m_peak_reset_ok;
     ctx->rss_entry_kb      = m_rss_entry_kb;
     ctx->thr_base          = ndp_proc_status_kb("Threads:");
+    ctx->heap_inuse_entry  = ndp_heap_inuse_bytes();
     ctx->cpu_user_start    = m_cpu_user0;
     ctx->cpu_sys_start     = m_cpu_sys0;
     ctx->cpu_reactor_start = m_cpu_reactor0;
