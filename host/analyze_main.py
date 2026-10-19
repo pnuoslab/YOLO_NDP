@@ -51,7 +51,7 @@ def stage_sum(r):
 
 def main():
     path = sys.argv[1]
-    want = set(sys.argv[2:]) or {"E1", "E5"}
+    want = (set(sys.argv[2:]) or {"E1", "E5"}) - {"E2", "E3"} or {"E1", "E5"}
     rows = [r for r in csv.DictReader(open(path))
             if r["exp"] in want and r["status"].startswith("ok") and r["frames"]]
     groups = defaultdict(list)
@@ -125,5 +125,45 @@ def main():
         print(f"| {k[1]} | {k[2]} | " + " | ".join(f"{v:.1f}" for v in vals) + " |")
 
 
+def accuracy(path):
+    """E2 (scene/accuracy, sws) and E3 (darknet-kernel ablation): mAP per
+    condition. The detector is deterministic, so the three repeats must give
+    the same mAP; the spread is printed to prove it rather than assumed."""
+    rows = [r for r in csv.DictReader(open(path))
+            if r["exp"] in ("E2", "E3") and r["status"].startswith("ok")]
+    g = defaultdict(list)
+    for r in rows:
+        g[(r["input"], r["sample_rate"], r["pipeline"], r["kernel"])].append(r)
+    seqs = sorted({k[0] for k in g})
+    order = {"BASE": 0, "q85": 1, "q100": 2, "raw": 3}
+
+    print("\n## Accuracy: mAP@0.5 / mAP@[.5:.95] (%), and delta vs Baseline (pp)\n")
+    print("| seq | sr | pipeline | kernel | mAP50 | mAP50-95 | Δ50 | Δ50-95 | spread over repeats | stage sum s | speedup |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    for sq in seqs:
+        for sr in ("1", "2", "5"):
+            base = g.get((sq, sr, "BASE", "sws"))
+            if not base:
+                continue
+            b50 = ms([f(r, "ap50") for r in base])[0]
+            b95 = ms([f(r, "ap5095") for r in base])[0]
+            bss = ms([stage_sum(r) for r in base])[0]
+            for (s2, r2, p, k), gr in sorted(
+                    ((k, v) for k, v in g.items() if k[0] == sq and k[1] == sr),
+                    key=lambda kv: (order[kv[0][2]], kv[0][3])):
+                a50 = [f(r, "ap50") for r in gr]
+                a95 = ms([f(r, "ap5095") for r in gr])[0]
+                m50 = ms(a50)[0]
+                spread = max(a50) - min(a50)
+                ss = ms([stage_sum(r) for r in gr])[0]
+                d50 = "" if p == "BASE" else f"{m50 - b50:+.2f}"
+                d95 = "" if p == "BASE" else f"{a95 - b95:+.2f}"
+                sp = "" if p == "BASE" else f"{bss / ss:.2f}×"
+                print(f"| {sq} | {sr} | {p} | {k if p != 'BASE' else '-'} | {m50:.2f} | {a95:.2f} | "
+                      f"{d50} | {d95} | {spread:.4f} | {ss:.2f} | {sp} |")
+
+
 if __name__ == "__main__":
     main()
+    if {"E2", "E3"} & set(sys.argv[2:]):
+        accuracy(sys.argv[1])

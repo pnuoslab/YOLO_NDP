@@ -54,14 +54,22 @@ def parse_kv(line):
 
 
 def read_measure(path, tag):
-    """Last line starting with the given tag, as a dict."""
+    """key=value pairs that follow the last occurrence of `tag`.
+
+    The tag may sit mid-line: the target prints [NDP-MEASURE] through SPDK's
+    logger, behind a timestamp and source location. An earlier version only
+    accepted lines that START with the tag, which is right for the host's
+    [MEASURE] line and silently dropped every target line. Only the text
+    after the tag is parsed, so the logger prefix is never read as fields.
+    """
     if not path or not os.path.isfile(path):
         return {}
     found = ""
     with open(path, errors="replace") as f:
         for line in f:
-            if line.startswith(tag):
-                found = line.strip()
+            i = line.find(tag)
+            if i >= 0:
+                found = line[i + len(tag):].strip()
     return parse_kv(found) if found else {}
 
 
@@ -175,22 +183,36 @@ def main():
             tgt["run_id"] != row["run_id_req"]:
         row["status"] = "fail_tgt_runid_mismatch"
 
-    cols = (COND_FIELDS + MEASURE_FIELDS + HOST_IO_FIELDS + TGT_IO_FIELDS
-            + sorted(extra))
     row.update(extra)
+    fixed = COND_FIELDS + MEASURE_FIELDS + HOST_IO_FIELDS + TGT_IO_FIELDS
 
-    # Header is written once; later rows with new target keys are appended
-    # under the original header, so the header is taken from the file when
-    # it already exists.
-    exists = os.path.isfile(args.csv) and os.path.getsize(args.csv) > 0
-    if exists:
+    # The header is the union of every row's keys. An earlier version froze
+    # it at the first row - a Baseline run, with no target line - and then
+    # dropped every target field of every later NDP row. Now, when a row
+    # brings a key the file does not have, the whole file is rewritten with
+    # the wider header (a few hundred rows; the cost is nothing next to a
+    # run). Written to a temp file and renamed, so a crash cannot leave a
+    # half-written results.csv.
+    old_rows, old_cols = [], []
+    if os.path.isfile(args.csv) and os.path.getsize(args.csv) > 0:
         with open(args.csv, newline="") as f:
-            cols = next(csv.reader(f))
-    with open(args.csv, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
-        if not exists:
+            rd = csv.DictReader(f)
+            old_cols = list(rd.fieldnames or [])
+            old_rows = list(rd)
+    new_keys = [k for k in sorted(row) if k not in old_cols and k not in fixed]
+    if old_cols and not new_keys and all(k in old_cols for k in fixed):
+        with open(args.csv, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=old_cols, extrasaction="ignore").writerow(row)
+    else:
+        extra_cols = sorted({k for r in old_rows + [row] for k in r} - set(fixed))
+        cols = fixed + extra_cols
+        tmp = args.csv + ".tmp"
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
-        w.writerow(row)
+            for r in old_rows + [row]:
+                w.writerow(r)
+        os.replace(tmp, args.csv)
 
     print(f"[row] {row['exp']} {row['input']} {row['pipeline']} "
           f"sr={row['sample_rate']} rep={row['rep']} "

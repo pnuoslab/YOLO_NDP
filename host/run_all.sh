@@ -138,6 +138,11 @@ if [ -n "$TARGET_HOST" ]; then
       fi
       echo "[WARN] ALLOW_IOTRACE=1: measuring against a tracing build" ;;
   esac
+  # pgrep shows the path as typed at launch, which may be relative (it was:
+  # "build/bin/nvmf_tgt_measure", so sha256sum from $HOME found nothing and
+  # env.txt recorded "?"). /proc/<pid>/exe is the absolute path of what is
+  # actually running.
+  TARGET_BIN=$(tssh "p=\$(pgrep -f 'build/bin/nvmf_tgt' | head -1); readlink -f /proc/\$p/exe 2>/dev/null" 2>/dev/null || echo "$TARGET_BIN")
   TARGET_BIN_SHA=$(tssh "sha256sum '$TARGET_BIN' | cut -d' ' -f1" 2>/dev/null || true)
   if ! tssh "test -r '$TARGET_LOG'" 2>/dev/null; then
     echo "[ERR] TARGET_LOG=$TARGET_LOG is not readable on $TARGET_HOST;"
