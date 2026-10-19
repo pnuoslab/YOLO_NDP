@@ -1338,6 +1338,7 @@ struct ndp_request_ctx {
     uint32_t chroma_444;       /* cdw12[8],    0 = 4:2:0 (default) */
     uint32_t darknet_kernel;   /* cdw12[9],    1 = darknet-compatible resize */
     uint32_t run_id;           /* cdw13, echoed back so the host can pair logs */
+    uint32_t dec_threads_req;  /* cdw14, decoder thread_count; 0 = auto (default) */
 
     /* Measurement state, all written on the reactor thread. */
     struct timespec ssd_read_start;   /* just before the first bdev read */
@@ -1347,6 +1348,7 @@ struct ndp_request_ctx {
     double   cpu_sys_start;
     double   cpu_reactor_start;       /* reactor thread CPU at 0xC0 entry */
     long     rss_entry_kb;            /* VmRSS at 0xC0 entry, after peak reset */
+    long     thr_base;                /* process Threads at 0xC0 entry */
     bool     peak_rss_reset_ok;
 };
 
@@ -1630,6 +1632,11 @@ struct ndp_offload_ctx {
     double    m_serialize_ms;     /* result buffer alloc + per-frame memcpy */
     size_t    m_payload_bytes;    /* accumulated per-frame payloads */
     size_t    m_peak_bytes;       /* manual high-water mark */
+
+    /* Decoder threading, sampled outside the frame loop. */
+    const char *m_dec_name;       /* AVCodec->name actually selected; static string */
+    int       m_dec_threads_set;  /* codec_ctx->thread_count after avcodec_open2 */
+    long      m_thr_peak;         /* max of process Threads before/after the loop */
 };
 
 static void
@@ -1709,7 +1716,9 @@ preprocess_done_on_spdk_thread(void *arg)
                            "ssd_read_ms=%.3f ssd_read_bytes=%" PRIu64 " serialize_ms=%.3f "
                            "cpu_user_s=%.3f cpu_sys_s=%.3f cpu_reactor_s=%.3f cpu_storage_s=%.3f "
                            "dma_readbuf_mb=%.1f dma_blob_mb=%.1f heap_peak_delta_mb=%.1f "
-                           "storage_mem_total_mb=%.1f\n",
+                           "storage_mem_total_mb=%.1f "
+                           "dec_name=%s dec_threads_req=%u dec_threads_set=%d "
+                           "thr_peak=%ld thr_base=%ld\n",
                            mctx->run_id,
                            off->m_jpeg_q,
                            off->m_jpeg_q < 0 ? "-" : (off->m_chroma_444 ? "444" : "420"),
@@ -1726,7 +1735,10 @@ preprocess_done_on_spdk_thread(void *arg)
                            mctx->ssd_read_ms, mctx->ssd_read_bytes, off->m_serialize_ms,
                            d_user, d_sys, d_reactor, cpu_storage,
                            dma_readbuf_mb, dma_blob_mb, heap_peak_delta_mb,
-                           storage_mem_total_mb);
+                           storage_mem_total_mb,
+                           off->m_dec_name ? off->m_dec_name : "-",
+                           mctx->dec_threads_req, off->m_dec_threads_set,
+                           off->m_thr_peak, mctx->thr_base);
         }
     } else {
         /* Worker reported failure */
@@ -1826,12 +1838,33 @@ ndp_preprocess_worker(void *arg)
     codec_ctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(codec_ctx,
         fmt_ctx->streams[video_stream_idx]->codecpar);
-    codec_ctx->thread_count = 0;
+    /*
+     * Decoder thread count comes from cdw14. 0 keeps the original behaviour
+     * (thread_count = 0, libavcodec decides). A nonzero value pins it; this
+     * exists so the AV1 path (libdav1d, which sizes its own pool from the CPU
+     * count) can be held to the worker's 14-core affinity instead of
+     * oversubscribing it. Clamped so a garbage dword cannot ask for an absurd
+     * number of threads.
+     */
+    {
+        uint32_t req = ctx->dec_threads_req;
+        if (req > 256) req = 256;
+        codec_ctx->thread_count = (int)req;
+    }
     codec_ctx->thread_type = FF_THREAD_FRAME;
     if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
         off->sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
         goto release;
     }
+
+    /*
+     * What the decoder actually ended up with. For frame-threaded decoders
+     * (h264, hevc) libavcodec writes the resolved count back into
+     * thread_count. libdav1d does not - it keeps its own pool - so for AV1
+     * this stays at the requested value and thr_peak is the real evidence.
+     */
+    off->m_dec_name        = codec->name;
+    off->m_dec_threads_set = codec_ctx->thread_count;
  
     int64_t total_nb_frames = fmt_ctx->streams[video_stream_idx]->nb_frames;
     if (total_nb_frames <= 0) total_nb_frames = 1000;
@@ -1864,6 +1897,13 @@ ndp_preprocess_worker(void *arg)
                    darknet_kernel ? "darknet" : "swscale");
     SPDK_NOTICELOG("[NDP-worker] Start decoding: total_frames=%ld, max_samples=%d\n",
                    total_nb_frames, max_samples);
+
+    /*
+     * Thread count, sample 1 of 2. Frame-threaded decoders and libdav1d create
+     * their pools inside avcodec_open2(), so they already exist here. Taken
+     * before the preprocess timer starts so the /proc read is not timed.
+     */
+    long thr_before_loop = ndp_proc_status_kb("Threads:");
 
     clock_gettime(CLOCK_MONOTONIC, &preprocess_start);
  
@@ -1972,6 +2012,17 @@ ndp_preprocess_worker(void *arg)
     clock_gettime(CLOCK_MONOTONIC, &preprocess_end);
     t_preprocess_total = (preprocess_end.tv_sec  - preprocess_start.tv_sec) +
                          (preprocess_end.tv_nsec - preprocess_start.tv_nsec) / 1e9;
+
+    /*
+     * Thread count, sample 2 of 2, after the timer has stopped and before the
+     * decoder is freed. Two samples bracket the loop; a pool that grew and
+     * shrank entirely inside it would be missed, so thr_peak is a lower bound
+     * on the true peak.
+     */
+    {
+        long thr_after_loop = ndp_proc_status_kb("Threads:");
+        off->m_thr_peak = thr_before_loop > thr_after_loop ? thr_before_loop : thr_after_loop;
+    }
  
     SPDK_NOTICELOG("[NDP-verify] decoded_frames=%d  sampled_count=%d  "
                    "max_samples=%d\n", frame_idx, sampled_count, max_samples);
@@ -2292,9 +2343,18 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
      */
     ctx->run_id = cmd->cdw13;
 
+    /*
+     * cdw14 was likewise unused by 0xC0 (the only reference in this file is a
+     * commented-out debug line in the ordinary read path). It carries the
+     * decoder thread count; 0 means auto, i.e. the behaviour before this
+     * option existed.
+     */
+    ctx->dec_threads_req = cmd->cdw14;
+
     /* Carry the entry baselines captured above into the request context. */
     ctx->peak_rss_reset_ok = m_peak_reset_ok;
     ctx->rss_entry_kb      = m_rss_entry_kb;
+    ctx->thr_base          = ndp_proc_status_kb("Threads:");
     ctx->cpu_user_start    = m_cpu_user0;
     ctx->cpu_sys_start     = m_cpu_sys0;
     ctx->cpu_reactor_start = m_cpu_reactor0;
