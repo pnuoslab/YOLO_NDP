@@ -346,7 +346,7 @@ fi
 # command line in the log says what the post-processing did. Repeats are
 # the outermost loop; conditions with 3 repeats run in repeats 1-3, K2
 # (one accuracy run per pipeline) in repeat 1.
-PILOT_STEPS="P3 L1 L2 C1 D1 D2 K1 K2"
+PILOT_STEPS="P3 L1 L2 C1 D1 D1b D2 K1 K2"
 is_pilot=0
 for s in "${STEPS[@]:-}"; do case " $PILOT_STEPS " in *" $s "*) is_pilot=1 ;; esac; done
 if [ "$is_pilot" = 1 ]; then
@@ -377,6 +377,14 @@ if [ "$is_pilot" = 1 ]; then
     if do_step D1; then
       for r in 1080 2160; do
         one_run D1 "res${r}_av1" "$M/res${r}_av1.mp4" - q85 sws 85 1 "$rep" 0 "$PT -dec_threads 14" _dt14
+      done
+    fi
+    # D1b (added; not in spec 03b-H): libdav1d turns cdw14=14 into 25 threads
+    # but 6 into 12, the largest that fits the target's 14 cores
+    # (result_03b_target.md section 1-3).
+    if do_step D1b; then
+      for r in 1080 2160; do
+        one_run D1b "res${r}_av1" "$M/res${r}_av1.mp4" - q85 sws 85 1 "$rep" 0 "$PT -dec_threads 6" _dt6
       done
     fi
     if do_step D2; then
