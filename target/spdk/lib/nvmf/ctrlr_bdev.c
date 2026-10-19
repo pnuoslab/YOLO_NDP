@@ -1413,6 +1413,7 @@ static enum AVPixelFormat g_sws_fmt  = AV_PIX_FMT_NONE;
  * offloaded pipeline numerically comparable to the host baseline.
  */
 static uint8_t *ndp_resize_darknet_rgb(const uint8_t *src, int sw, int sh,
+                                       int src_stride,
                                        int dw, int dh)
 {
     if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return NULL;
@@ -1426,7 +1427,7 @@ static uint8_t *ndp_resize_darknet_rgb(const uint8_t *src, int sw, int sh,
 
     /* Horizontal pass: source rows kept, columns resampled into float. */
     for (int r = 0; r < sh; ++r) {
-        const uint8_t *srow = src  + (size_t)r * sw * 3;
+        const uint8_t *srow = src  + (size_t)r * src_stride;
         float         *prow = part + (size_t)r * dw * 3;
         for (int c = 0; c < dw; ++c) {
             if (c == dw - 1 || sw == 1) {
@@ -1522,19 +1523,35 @@ static uint8_t *ndp_frame_to_letterbox_rgb(AVFrame *frame,
     }
     if (!g_sws_ctx) return NULL;
  
-    uint8_t *conv = (uint8_t *)malloc((size_t)cvt_w * cvt_h * 3);
+    /*
+     * swscale's x86 same-size yuv420p -> rgb24 converter (the darknet path's
+     * call) works in blocks of 8 pixels. With a packed stride of 3 * w and
+     * w % 8 != 0 it stops at the last full block and never writes the final
+     * w % 8 pixels of each row, which then hold whatever malloc() returned.
+     * For MOT20-03 (1174 wide) that left columns 1168-1173 uninitialised and
+     * made the darknet output differ from run to run. Rounding the stride up
+     * to a multiple of 8 pixels lets it convert whole rows. Its stores then
+     * run up to 32 bytes past the end of the last row (seen under Valgrind),
+     * hence the 64 bytes of tail slack. For widths that are already a
+     * multiple of 8 (1920, and every 416-wide scaled output) the stride and
+     * the converted pixels are unchanged.
+     */
+    const int conv_stride = 3 * ((cvt_w + 7) & ~7);
+    uint8_t *conv = (uint8_t *)malloc((size_t)conv_stride * cvt_h + 64);
     if (!conv) return NULL;
     uint8_t *dst[4]    = { conv, NULL, NULL, NULL };
-    int      dst_ls[4] = { 3 * cvt_w, 0, 0, 0 };
+    int      dst_ls[4] = { conv_stride, 0, 0, 0 };
     sws_scale(g_sws_ctx,
               (const uint8_t * const *)frame->data, frame->linesize,
               0, sh, dst, dst_ls);
- 
+
     uint8_t *scaled = conv;
+    int      scaled_stride = conv_stride;
     if (darknet_kernel) {
-        scaled = ndp_resize_darknet_rgb(conv, cvt_w, cvt_h, new_w, new_h);
+        scaled = ndp_resize_darknet_rgb(conv, cvt_w, cvt_h, conv_stride, new_w, new_h);
         free(conv);
         if (!scaled) return NULL;
+        scaled_stride = 3 * new_w;   /* the resize output is packed */
     }
  
     /* Grey padding, matching darknet's 0.5f fill value */
@@ -1546,7 +1563,7 @@ static uint8_t *ndp_frame_to_letterbox_rgb(AVFrame *frame,
     int dy = (net_h - new_h) / 2;
     for (int j = 0; j < new_h; ++j)
         memcpy(lb + ((size_t)(dy + j) * net_w + dx) * 3,
-               scaled + (size_t)j * new_w * 3,
+               scaled + (size_t)j * scaled_stride,
                (size_t)new_w * 3);
  
     free(scaled);
