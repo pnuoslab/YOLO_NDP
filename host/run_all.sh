@@ -153,7 +153,10 @@ if [ -n "$TARGET_HOST" ]; then
 fi
 
 # ── environment record ────────────────────────────────────────────────
-ENVTXT="$RESULTS/env.txt"
+# One file per invocation. Two blocks share a RESULTS directory (E1+E5,
+# then E2+E3), and a single env.txt let the second block overwrite the
+# first block's record of the commit and target binary it ran with.
+ENVTXT="$RESULTS/env_$(echo "${STEPS[@]:-all}" | tr ' ' '_')$([ "$SMOKE" = 1 ] && echo _smoke)_$(date +%m%d_%H%M).txt"
 {
   echo "date: $(date -Is)"
   echo "host: $(hostname)  kernel: $(uname -r)"
