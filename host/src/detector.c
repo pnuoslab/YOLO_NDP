@@ -1266,7 +1266,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
                          char *save_img_dir, char *save_log_path,
                          char *dump_dets_path, uint32_t run_id,
                          float post_thresh, int cv_threads,
-                         uint32_t dec_threads)
+                         uint32_t dec_threads, int warmup_iters)
 {
     int i, j;
  
@@ -1317,7 +1317,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     double t_warmup = what_time_is_it_now();
     {
         image dummy = make_image(net.w, net.h, net.c);
-        for (i = 0; i < 3; ++i) network_predict(net, dummy.data);
+        for (i = 0; i < warmup_iters; ++i) network_predict(net, dummy.data);
         free_image(dummy);
     }
     t_warmup = what_time_is_it_now() - t_warmup;
@@ -1570,7 +1570,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     for (;;) {
         image im_input;
         im_input.data = NULL; im_input.w = 0; im_input.h = 0; im_input.c = 0;
-        mat_cv *in_img = NULL;   /* baseline: full-resolution copy, freed in cleanup */
+        mat_cv *in_img = NULL;   /* baseline: full-resolution copy */
  
         double c_stage = vmap_cpu_total();
         double t_stage = what_time_is_it_now();
@@ -1596,13 +1596,17 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         }
         t_pre += what_time_is_it_now() - t_stage;
         t_cpu_pre += vmap_cpu_total() - c_stage;
-        if (!use_ndp && (!im_input.data || im_input.w == 0)) {
+        if (!use_ndp) {
+            /* Freed at the same point as darknet's standard path (right
+             * after the frame is read): moving this free after inference
+             * changed the allocation pattern and shifted host_pre by -6%
+             * (03b smoke). Only its time is booked to cleanup. */
             c_stage = vmap_cpu_total();
             t_stage = what_time_is_it_now();
             if (in_img) release_mat(&in_img);
             t_cleanup += what_time_is_it_now() - t_stage;
             t_cpu_cleanup += vmap_cpu_total() - c_stage;
-            break;
+            if (!im_input.data || im_input.w == 0) break;
         }
  
         if (!im_input.data || im_input.w != net.w || im_input.h != net.h) {
@@ -1749,7 +1753,6 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         free_detections(dets, nboxes);
         free(truth);
         free_image(im_input);
-        if (in_img) release_mat(&in_img);
         t_cleanup += what_time_is_it_now() - t_stage;
         t_cpu_cleanup += vmap_cpu_total() - c_stage;
  
@@ -1950,7 +1953,7 @@ measure_only:
                "run_id=%u bl_decode_s=%.3f bl_copy_s=%.3f bl_mat2img_s=%.3f "
                "bl_letterbox_s=%.3f host_cpu_user_s=%.3f host_cpu_sys_s=%.3f "
                "host_cpu_pre_s=%.3f host_cpu_infer_s=%.3f "
-               "post_thresh=%.3f cv_threads=%d dec_threads_req=%u "
+               "post_thresh=%.3f cv_threads=%d dec_threads_req=%u warmup_iters=%d "
                "warmup_s=%.3f ndp_meta_open_s=%.3f bl_open_s=%.3f setup_s=%.3f "
                "post_s=%.3f eval_s=%.3f cleanup_s=%.3f stage_sum_s=%.3f "
                "resid_pct=%.3f host_cpu_post_s=%.3f host_cpu_eval_s=%.3f "
@@ -1995,7 +1998,7 @@ measure_only:
                 * CPU from /proc/self/stat (10 ms ticks), to cross-check
                 * host_cpu_user_s + host_cpu_sys_s. Both RSS figures are host
                 * memory only: GPU memory is not included. */
-               thresh, cv_threads_eff, dec_threads,
+               thresh, cv_threads_eff, dec_threads, warmup_iters,
                t_warmup, t_meta_open, t_bl_open, t_setup,
                t_post, t_eval, t_cleanup, stage_sum,
                t_e2e > 0 ? 100.0 * (t_e2e - stage_sum) / t_e2e : 0.0,
@@ -3591,6 +3594,7 @@ static void ndp_print_usage(const char *prog)
 "                      Default -1 leaves OpenCV untouched.\n"
 "  -dec_threads <n>    NDP only: target decoder threads, sent in cdw14.\n"
 "                      0 (default) keeps the target's auto setting.\n"
+"  -warmup <n>         GPU warm-up forward passes before e2e (default 3).\n"
 "\n"
 "Examples\n"
 "  # A: host baseline, every frame\n"
@@ -3734,6 +3738,8 @@ void run_detector(int argc, char **argv)
         int   cv_threads  = find_int_arg(argc, argv, "-cv_threads", -1);
         /* Target decoder threads via cdw14. 0 = target default (auto). */
         int   dec_threads = find_int_arg(argc, argv, "-dec_threads", 0);
+        /* GPU warm-up forward passes before e2e (both pipelines). */
+        int   warmup_iters = find_int_arg(argc, argv, "-warmup", 3);
         if (dec_threads < 0) {
             fprintf(stderr, "[MAP] -dec_threads must be >= 0 (got %d)\n", dec_threads);
             return;
@@ -3779,7 +3785,8 @@ void run_detector(int argc, char **argv)
                            thresh, iou_thresh, map_points, coco_range,
                            jpeg_q, chroma_444, darknet_kernel,
                            save_img, save_log, dump_dets, run_id,
-                           post_thresh, cv_threads, (uint32_t)dec_threads);
+                           post_thresh, cv_threads, (uint32_t)dec_threads,
+                           warmup_iters);
     }
     else if (0 == strcmp(argv[2], "demo")) {
         list *options = read_data_cfg(datacfg);

@@ -30,7 +30,7 @@ MEASURE_FIELDS = [
     "bl_decode_s", "bl_copy_s", "bl_mat2img_s", "bl_letterbox_s",
     "host_cpu_user_s", "host_cpu_sys_s", "host_cpu_pre_s", "host_cpu_infer_s",
     # spec 03b-H section 2
-    "post_thresh", "cv_threads", "dec_threads_req",
+    "post_thresh", "cv_threads", "dec_threads_req", "warmup_iters",
     "warmup_s", "ndp_meta_open_s", "bl_open_s", "setup_s",
     "post_s", "eval_s", "cleanup_s", "stage_sum_s", "resid_pct",
     "host_cpu_post_s", "host_cpu_eval_s", "host_cpu_cleanup_s",
