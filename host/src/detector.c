@@ -1223,14 +1223,21 @@ static double vmap_cpu_total(void)
 }
 
 /* Process CPU time (utime + stime, all threads) from /proc/self/stat, as an
- * independent cross-check of getrusage(). Clock-tick resolution (10 ms). */
+ * independent cross-check of getrusage(). Clock-tick resolution (10 ms).
+ *
+ * Deliberately open()/read() into a stack buffer, not stdio: fopen() puts a
+ * small buffer on the heap, and that one malloc/free just before the frame
+ * loop moved the baseline's large per-frame buffers enough to make
+ * mat_to_image() 12% faster (spec 04-H section 2-1). The instrumentation
+ * must not touch the heap. */
 static double vmap_procstat_cpu(void)
 {
     char buf[1024];
-    FILE *f = fopen("/proc/self/stat", "r");
-    if (!f) return -1.0;
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
+    int fd = open("/proc/self/stat", O_RDONLY);
+    if (fd < 0) return -1.0;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1.0;
     buf[n] = 0;
     /* comm (field 2) may contain spaces; count fields after its ')' */
     char *p = strrchr(buf, ')');
@@ -1305,10 +1312,13 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
     if (classes != names_size)
         fprintf(stderr, "[MAP] Warning: cfg classes=%d but names=%d\n", classes, names_size);
 
-    /* OpenCV's thread pool on the NDP host path only (JPEG decode, colour
-     * conversion). The baseline keeps darknet's standard behaviour. */
+    /* OpenCV's thread pool (cv::setNumThreads). Off unless -cv_threads is
+     * given. Meant for the NDP host path (JPEG decode, colour conversion);
+     * on the baseline it exists only as a reference measurement - standard
+     * baseline runs never pass it, so darknet's standard behaviour stays the
+     * default. The only effect is this one call; no pixel operation changes. */
     int cv_threads_eff = -1;
-    if (use_ndp && cv_threads >= 0)
+    if (cv_threads >= 0)
         cv_threads_eff = ndp_set_cv_threads(cv_threads);
 
     /* GPU warm-up, identical for both pipelines and outside e2e: the first
@@ -1400,7 +1410,7 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
      * getrusage() cost never lands inside t_pre / t_infer. */
     double t_cpu_pre = 0.0, t_cpu_infer = 0.0;
     double t_cpu_post = 0.0, t_cpu_eval = 0.0, t_cpu_cleanup = 0.0;
-    double procstat_start = 0.0, procstat_loop = 0.0;
+    double procstat_total = 0.0, rusage_total = 0.0;
     double cpu_user_start = 0.0, cpu_sys_start = 0.0;
     double cpu_user_loop  = 0.0, cpu_sys_loop  = 0.0;
     uint64_t transfer_bytes = 0;
@@ -1562,7 +1572,6 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
      * before the loop so they cover exactly the same work as t_pre/t_infer. */
     bl_timers_reset();
     vmap_cpu_times(&cpu_user_start, &cpu_sys_start);
-    procstat_start = vmap_procstat_cpu();
     t_setup = what_time_is_it_now() - t_e2e_start - t_bl_open - t_c0 - t_io;
  
     /* ---- frame loop ---- */
@@ -1779,7 +1788,12 @@ float validate_video_map(char *datacfg, char *cfgfile, char *weightfile,
         vmap_cpu_times(&u, &sy);
         cpu_user_loop = u - cpu_user_start;
         cpu_sys_loop  = sy - cpu_sys_start;
-        procstat_loop = vmap_procstat_cpu() - procstat_start;
+        /* Whole-process CPU by both methods, read back to back after the
+         * loop. Nothing is read before the loop: a /proc/self/stat read
+         * there made the baseline's mat_to_image() 12% faster (spec 04-H
+         * section 2-1), so the cross-check stays out of the timed window. */
+        procstat_total = vmap_procstat_cpu();
+        rusage_total = u + sy;
     }
 
     const int num_eval_frames = image_index;
@@ -1957,7 +1971,7 @@ measure_only:
                "warmup_s=%.3f ndp_meta_open_s=%.3f bl_open_s=%.3f setup_s=%.3f "
                "post_s=%.3f eval_s=%.3f cleanup_s=%.3f stage_sum_s=%.3f "
                "resid_pct=%.3f host_cpu_post_s=%.3f host_cpu_eval_s=%.3f "
-               "host_cpu_cleanup_s=%.3f host_cpu_procstat_s=%.3f "
+               "host_cpu_cleanup_s=%.3f host_cpu_procstat_s=%.3f host_cpu_rusage_total_s=%.3f "
                "host_maxrss_mb=%.1f host_vmhwm_mb=%.1f host_threads_end=%ld\n",
                use_ndp ? "ndp" : "baseline",
                use_ndp ? (jpeg_quality ? jpeg_quality : 85) : -1,
@@ -1994,15 +2008,18 @@ measure_only:
                 * confidence floor actually used for get_network_boxes()
                 * (0.005 whenever labels, a dump or a log is requested).
                 * cv_threads is cv::getNumThreads() after -cv_threads, -1 if
-                * OpenCV was left untouched. host_cpu_procstat_s is the loop's
-                * CPU from /proc/self/stat (10 ms ticks), to cross-check
-                * host_cpu_user_s + host_cpu_sys_s. Both RSS figures are host
+                * OpenCV was left untouched. host_cpu_procstat_s and
+                * host_cpu_rusage_total_s are the WHOLE process's CPU (model
+                * load included) from /proc/self/stat (10 ms ticks) and from
+                * getrusage(), read together after the loop - the two-method
+                * cross-check. The loop's own CPU is host_cpu_user_s +
+                * host_cpu_sys_s (getrusage). Both RSS figures are host
                 * memory only: GPU memory is not included. */
                thresh, cv_threads_eff, dec_threads, warmup_iters,
                t_warmup, t_meta_open, t_bl_open, t_setup,
                t_post, t_eval, t_cleanup, stage_sum,
                t_e2e > 0 ? 100.0 * (t_e2e - stage_sum) / t_e2e : 0.0,
-               t_cpu_post, t_cpu_eval, t_cpu_cleanup, procstat_loop,
+               t_cpu_post, t_cpu_eval, t_cpu_cleanup, procstat_total, rusage_total,
                (double)ru.ru_maxrss / 1024.0,
                (double)vmap_status_field("VmHWM:") / 1024.0,
                vmap_status_field("Threads:"));
@@ -3590,7 +3607,8 @@ static void ndp_print_usage(const char *prog)
 "  -post_thresh <f>    confidence floor for get_network_boxes() in a\n"
 "                      performance run (default 0.25). Accuracy runs (-labels,\n"
 "                      -dump_dets) always use 0.005.\n"
-"  -cv_threads <n>     NDP only: cv::setNumThreads(n) for the host JPEG path.\n"
+"  -cv_threads <n>     cv::setNumThreads(n). Meant for the NDP host JPEG path;\n"
+"                      on the baseline only as a reference measurement.\n"
 "                      Default -1 leaves OpenCV untouched.\n"
 "  -dec_threads <n>    NDP only: target decoder threads, sent in cdw14.\n"
 "                      0 (default) keeps the target's auto setting.\n"
@@ -3734,7 +3752,7 @@ void run_detector(int argc, char **argv)
         uint32_t run_id   = (uint32_t)find_int_arg(argc, argv, "-run_id", 0);
         /* Confidence floor for post-processing in a performance run. */
         float post_thresh = find_float_arg(argc, argv, "-post_thresh", .25f);
-        /* NDP host path only: cv::setNumThreads(n). -1 = leave OpenCV alone. */
+        /* cv::setNumThreads(n); -1 = leave OpenCV alone (see validate_video_map). */
         int   cv_threads  = find_int_arg(argc, argv, "-cv_threads", -1);
         /* Target decoder threads via cdw14. 0 = target default (auto). */
         int   dec_threads = find_int_arg(argc, argv, "-dec_threads", 0);

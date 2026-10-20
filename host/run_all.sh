@@ -130,7 +130,10 @@ tssh() {
 ALLOW_IOTRACE=${ALLOW_IOTRACE:-0}
 TARGET_BIN=""
 if [ -n "$TARGET_HOST" ]; then
-  TARGET_BIN=$(tssh "pgrep -a -f 'build/bin/nvmf_tgt' | grep -v -e sudo -e pgrep | awk '{print \$2}' | head -1" 2>/dev/null || true)
+  # Anchored at the start of the command line (relative or absolute launch
+  # path): an unanchored pattern also matches the ssh command's own shell.
+  TPAT='^(/[^ ]*/)?build/bin/nvmf_tgt'
+  TARGET_BIN=$(tssh "pgrep -a -f '$TPAT' | awk '{print \$2}' | head -1" 2>/dev/null || true)
   if [ -z "$TARGET_BIN" ]; then
     echo "[ERR] no nvmf_tgt process found on $TARGET_HOST"; exit 1
   fi
@@ -149,8 +152,20 @@ if [ -n "$TARGET_HOST" ]; then
   # "build/bin/nvmf_tgt_measure", so sha256sum from $HOME found nothing and
   # env.txt recorded "?"). /proc/<pid>/exe is the absolute path of what is
   # actually running.
-  TARGET_BIN=$(tssh "p=\$(pgrep -f 'build/bin/nvmf_tgt' | head -1); readlink -f /proc/\$p/exe 2>/dev/null" 2>/dev/null || echo "$TARGET_BIN")
+  TARGET_BIN=$(tssh "p=\$(pgrep -f '$TPAT' | head -1); readlink -f /proc/\$p/exe 2>/dev/null" 2>/dev/null || echo "$TARGET_BIN")
   TARGET_BIN_SHA=$(tssh "sha256sum '$TARGET_BIN' | cut -d' ' -f1" 2>/dev/null || true)
+  # Allow-list of measurement builds, and an optional exact-hash pin
+  # (EXPECT_TARGET_SHA) so a block can insist on one specific binary.
+  ALLOWED_TARGETS=${ALLOWED_TARGETS:-"nvmf_tgt nvmf_tgt_measure nvmf_tgt_measure_v2 nvmf_tgt_measure_v2_fix"}
+  case " $ALLOWED_TARGETS " in
+    *" $(basename "$TARGET_BIN") "*) ;;
+    *) if [ "$ALLOW_IOTRACE" != 1 ]; then
+         echo "[ERR] target binary $(basename "$TARGET_BIN") is not in ALLOWED_TARGETS ($ALLOWED_TARGETS)"; exit 1
+       fi ;;
+  esac
+  if [ -n "${EXPECT_TARGET_SHA:-}" ] && [ "$TARGET_BIN_SHA" != "$EXPECT_TARGET_SHA" ]; then
+    echo "[ERR] target sha256 $TARGET_BIN_SHA != EXPECT_TARGET_SHA $EXPECT_TARGET_SHA"; exit 1
+  fi
   if ! tssh "test -r '$TARGET_LOG'" 2>/dev/null; then
     echo "[ERR] TARGET_LOG=$TARGET_LOG is not readable on $TARGET_HOST;"
     echo "      [NDP-MEASURE] lines could not be paired. Set TARGET_LOG to the"
@@ -164,6 +179,9 @@ fi
 # then E2+E3), and a single env.txt let the second block overwrite the
 # first block's record of the commit and target binary it ran with.
 ENVTXT="$RESULTS/env_$(echo "${STEPS[@]:-all}" | tr ' ' '_')$([ "$SMOKE" = 1 ] && echo _smoke)_$(date +%m%d_%H%M).txt"
+# A function so that a multi-block invocation (the M4 steps) can also leave
+# one record per block, taken when the block starts.
+write_env() {
 {
   echo "date: $(date -Is)"
   echo "host: $(hostname)  kernel: $(uname -r)"
@@ -199,8 +217,10 @@ ENVTXT="$RESULTS/env_$(echo "${STEPS[@]:-all}" | tr ' ' '_')$([ "$SMOKE" = 1 ] &
   else
     echo "── target: TARGET_HOST not set, target columns will be empty ──"
   fi
-} > "$ENVTXT" 2>&1
-echo "[env] $ENVTXT"
+} > "$1" 2>&1
+echo "[env] $1"
+}
+write_env "$ENVTXT"
 
 # ── helpers ───────────────────────────────────────────────────────────
 drop_caches() {
@@ -406,6 +426,146 @@ if [ "$is_pilot" = 1 ]; then
   echo "runs: $SEQNO"
   echo "results: $CSV"
   echo "env:     $ENVTXT"
+  exit 0
+fi
+
+# ── spec 04-H: main measurement 2 (M4 steps) ─────────────────────────
+# Blocks run in the order given on the command line (spec order:
+# M4A M4C M4Cp M4D M4Dref M4E M4B M4G); inside a block the repeat is the
+# outermost loop. Each block leaves its own env_<block>_<time>.txt.
+# Performance runs: no labels, no dump, -post_thresh 0.25 -warmup 3;
+# -dec_threads / -cv_threads only where the block says so.
+M4_STEPS="M4A M4C M4Cp M4D M4Dref M4E M4B M4G"
+is_m4=0
+for s in "${STEPS[@]:-}"; do case " $M4_STEPS " in *" $s "*) is_m4=1 ;; esac; done
+if [ "$is_m4" = 1 ]; then
+  PT="-post_thresh 0.25 -warmup 3"
+  M=$NVME_MNT
+  NDP6="q85:sws:85 q100:sws:100 raw:sws:raw q85:darknet:85 q100:darknet:100 raw:darknet:raw"
+  # m4_ndp <exp> <tag> <video> <labels|-> <sr> <rep> <dump> <extra> <suffix> <pipe:kern:qual...>
+  m4_ndp() {
+    local exp=$1 tag=$2 v=$3 lab=$4 sr=$5 rep=$6 dump=$7 extra=$8 suf=$9; shift 9
+    local c
+    for c in "$@"; do
+      IFS=: read -r p k q <<< "$c"
+      one_run "$exp" "$tag" "$v" "$lab" "$p" "$k" "$q" "$sr" "$rep" "$dump" "$extra" "$suf"
+    done
+  }
+  block_start() { echo "##### block $1 start $(date -Is) #####"; write_env "$RESULTS/env_$1_$(date +%m%d_%H%M).txt"; }
+  block_end()   { echo "##### block $1 end $(date -Is) #####"; }
+
+  for step in "${STEPS[@]}"; do
+    case "$step" in
+    M4A)
+      block_start M4A
+      for rep in 1 2 3 4 5; do
+        for r in 1080 1440 2160; do
+          V="$M/res${r}_h264.mp4"
+          one_run M4A "res${r}_h264" "$V" - BASE sws - 1 "$rep" 0 "$PT"
+          m4_ndp M4A "res${r}_h264" "$V" - 1 "$rep" 0 "$PT" "" $NDP6
+        done
+      done
+      block_end M4A ;;
+    M4C)
+      block_start M4C
+      for rep in 1 2 3; do
+        for f in res1080_hevc res2160_hevc res1080_av1 res2160_av1; do
+          V="$M/$f.mp4"
+          one_run M4C "$f" "$V" - BASE sws - 1 "$rep" 0 "$PT"
+          case "$f" in *av1) dts="0 6 14" ;; *) dts="0 14" ;; esac
+          for dt in $dts; do
+            m4_ndp M4C "$f" "$V" - 1 "$rep" 0 "$PT -dec_threads $dt" "_dt$dt" \
+              q85:sws:85 raw:sws:raw q100:darknet:100
+          done
+        done
+      done
+      block_end M4C ;;
+    M4Cp)
+      block_start M4Cp
+      for rep in 1 2 3; do
+        for r in 1080 2160; do
+          m4_ndp M4Cp "res${r}_h264" "$M/res${r}_h264.mp4" - 1 "$rep" 0 "$PT -dec_threads 14" _dt14 \
+            q85:sws:85 raw:sws:raw q100:darknet:100
+        done
+      done
+      block_end M4Cp ;;
+    M4D)
+      block_start M4D
+      for rep in 1 2 3; do
+        for r in 1080 2160; do
+          m4_ndp M4D "res${r}_h264" "$M/res${r}_h264.mp4" - 1 "$rep" 0 "$PT -cv_threads 1" _ct1 $NDP6
+        done
+      done
+      block_end M4D ;;
+    M4Dref)
+      block_start M4Dref
+      for rep in 1 2 3; do
+        for r in 1080 2160; do
+          one_run M4Dref "res${r}_h264" "$M/res${r}_h264.mp4" - BASE sws - 1 "$rep" 0 "$PT -cv_threads 1" _ct1
+        done
+      done
+      block_end M4Dref ;;
+    M4E)
+      block_start M4E
+      for rep in 1 2 3; do
+        for sp in $MOT_SEQS; do
+          IFS=: read -r tag vid lab <<< "$sp"
+          one_run M4E "$tag" "$M/$vid" - BASE sws - 1 "$rep" 0 "$PT"
+          m4_ndp M4E "$tag" "$M/$vid" - 1 "$rep" 0 "$PT" "" $NDP6
+        done
+      done
+      block_end M4E ;;
+    M4B)
+      block_start M4B
+      for rep in 1 2 3; do
+        for r in 1080 1440 2160; do
+          for sr in 2 5; do
+            m4_ndp M4B "res${r}_h264" "$M/res${r}_h264.mp4" - "$sr" "$rep" 0 "$PT" "" $NDP6
+          done
+        done
+      done
+      block_end M4B ;;
+    M4G)
+      # Accuracy: labels + dump, -warmup 3 (post-processing at 0.005 is
+      # forced by the labels). MOT20-03 darknet x3 to check determinism.
+      block_start M4G
+      for sp in $MOT_SEQS; do
+        IFS=: read -r tag vid lab <<< "$sp"
+        one_run M4G "$tag" "$M/$vid" "$lab" BASE sws - 1 1 1 "-warmup 3"
+        m4_ndp M4G "$tag" "$M/$vid" "$lab" 1 1 1 "-warmup 3" "" $NDP6
+      done
+      for rep in 2 3; do
+        sp=$(echo $MOT_SEQS | tr ' ' '\n' | grep '^MOT20-03:')
+        IFS=: read -r tag vid lab <<< "$sp"
+        m4_ndp M4G "$tag" "$M/$vid" "$lab" 1 "$rep" 1 "-warmup 3" "" \
+          q85:darknet:85 q100:darknet:100 raw:darknet:raw
+      done
+      block_end M4G ;;
+    M4SMOKE)
+      ;;
+    *) echo "[ERR] unknown M4 step $step" ;;
+    esac
+  done
+  echo
+  echo "runs: $SEQNO"
+  echo "results: $CSV"
+  exit 0
+fi
+
+# spec 04-H section 5-2 smoke: kept apart from the M4 steps so its rows are
+# never mixed into the main measurement (run it with its own RESULTS).
+if [ "${STEPS[0]:-}" = "M4SMOKE" ]; then
+  PT="-post_thresh 0.25 -warmup 3"
+  M=$NVME_MNT
+  V="$M/res1080_h264.mp4"
+  one_run S4 res1080_h264 "$V" - BASE sws -   1 1 0 "$PT"
+  one_run S4 res1080_h264 "$V" - q85  sws 85  1 1 0 "$PT"
+  one_run S4 res1080_h264 "$V" - raw  darknet raw 1 1 0 "$PT"
+  one_run S4 res1080_av1 "$M/res1080_av1.mp4" - q85 sws 85 1 1 0 "$PT -dec_threads 6" _dt6
+  one_run S4 res1080_h264 "$V" - BASE sws -   1 1 0 "$PT -cv_threads 1" _ct1
+  echo
+  echo "runs: $SEQNO"
+  echo "results: $CSV"
   exit 0
 fi
 

@@ -34,7 +34,7 @@ MEASURE_FIELDS = [
     "warmup_s", "ndp_meta_open_s", "bl_open_s", "setup_s",
     "post_s", "eval_s", "cleanup_s", "stage_sum_s", "resid_pct",
     "host_cpu_post_s", "host_cpu_eval_s", "host_cpu_cleanup_s",
-    "host_cpu_procstat_s", "host_maxrss_mb", "host_vmhwm_mb", "host_threads_end",
+    "host_cpu_procstat_s", "host_cpu_rusage_total_s", "host_maxrss_mb", "host_vmhwm_mb", "host_threads_end",
 ]
 
 COND_FIELDS = ["exp", "input", "pipeline", "kernel", "quality",

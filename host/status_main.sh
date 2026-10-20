@@ -24,11 +24,15 @@ root, running = sys.argv[1], sys.argv[2]
 path = os.path.join(root, "results.csv")
 rows = list(csv.DictReader(open(path))) if os.path.isfile(path) else []
 plan = {"E1": 108, "E5": 24, "E2": 180, "E3": 45}
+# spec 04-H blocks (planned run counts)
+if "main04" in root or any(r["exp"].startswith("M4") for r in rows):
+    plan = {"M4A": 105, "M4C": 102, "M4Cp": 18, "M4D": 36, "M4Dref": 6,
+            "M4E": 105, "M4B": 108, "M4G": 41}
 print("── progress ──")
 done = {}
 for r in rows:
     done[r["exp"]] = done.get(r["exp"], 0) + 1
-for e in ["E1", "E5", "E2", "E3"]:
+for e in plan:
     n = done.get(e, 0)
     bar = "#" * int(20 * n / plan[e])
     print(f"  {e}: {n:3d}/{plan[e]:<3d} [{bar:<20s}]{'  done' if n >= plan[e] else ''}")
