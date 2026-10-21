@@ -279,9 +279,36 @@ def main():
     pd.DataFrame(rows).to_csv(os.path.join(FIG, "fig_latency_resolution.csv"), index=False)
     bcols = ["bl_open_s", "bl_decode_s", "bl_copy_s", "bl_mat2img_s", "bl_letterbox_s", "infer", "post_s", "cleanup_s"]
     A[A.cfg == "BASE"].groupby("input")[bcols].agg(["mean", "std"]).to_csv(os.path.join(FIG, "fig_baseline_breakdown.csv"))
-    ncols = ["tgt_ssd_read_ms", "tgt_decode", "tgt_letterbox", "tgt_encode", "tgt_pre_total", "tgt_serialize_ms",
-             "target_pre", "io", "setup_s", "host_pre", "infer", "post_s", "cleanup_s"]
-    A[A.cfg != "BASE"].groupby(["input", "cfg"])[ncols].agg(["mean", "std"]).to_csv(os.path.join(FIG, "fig_ndp_breakdown.csv"))
+    # NDP breakdown, one flat header, seconds. The target's stages sit inside
+    # its 0xC0 round trip (target_pre): ssd_read + pre_total + serialize +
+    # untimed rest (c0_other_s). Inside pre_total, tgt_decode is only the
+    # wait in avcodec_receive_frame (decoding runs on decoder threads in
+    # parallel), so decode work is not separable here - see spec 05 block T.
+    nd = A[A.cfg != "BASE"].copy()
+    nd["tgt_ssd_read_s"] = nd.tgt_ssd_read_ms / 1000
+    nd["tgt_serialize_s"] = nd.tgt_serialize_ms / 1000
+    nd["tgt_pre_other_s"] = nd.tgt_pre_total - nd.tgt_decode - nd.tgt_letterbox - nd.tgt_encode
+    nd["c0_other_s"] = nd.target_pre - nd.tgt_ssd_read_s - nd.tgt_pre_total - nd.tgt_serialize_s
+    stages = [("tgt_ssd_read_s", "target: SSD read"), ("tgt_decode", "target: decode wait (receive_frame)"),
+              ("tgt_letterbox", "target: resize + letterbox"), ("tgt_encode", "target: JPEG encode (0 for raw)"),
+              ("tgt_pre_other_s", "target: rest of pre_total"), ("tgt_pre_total", "target: pre_total (sum of the four above)"),
+              ("tgt_serialize_s", "target: serialize result"), ("c0_other_s", "target: untimed rest of the 0xC0 round trip"),
+              ("target_pre", "host: 0xC0 round trip"), ("io", "host: 0xC2 transfer"), ("setup_s", "host: setup"),
+              ("host_pre", "host: JPEG decode / raw unpack"), ("infer", "host: inference"), ("post_s", "host: post-processing"),
+              ("cleanup_s", "host: cleanup"), ("stage_sum_s", "host: sum of stages"), ("e2e", "host: e2e")]
+    rows = []
+    for (inp, cfg), g in nd.groupby(["input", "cfg"], sort=False):
+        r = dict(input=inp, cfg=cfg, n=len(g))
+        for col, _ in stages:
+            c_ = ci(g[col])
+            r[f"{col}_mean"] = round(c_["mean"], 4); r[f"{col}_sd"] = round(c_["sd"], 4)
+            r[f"{col}_lo"] = round(c_["lo"], 4); r[f"{col}_hi"] = round(c_["hi"], 4)
+        rows.append(r)
+    order = {k: i for i, k in enumerate(RES)}
+    fb = pd.DataFrame(rows)
+    fb = fb.sort_values(["input", "cfg"], key=lambda s_: s_.map(order) if s_.name == "input" else s_.map({c: i for i, c in enumerate(CFGS)}))
+    fb.to_csv(os.path.join(FIG, "fig_ndp_breakdown.csv"), index=False)
+    pd.DataFrame(stages, columns=["column", "meaning"]).to_csv(os.path.join(FIG, "fig_ndp_breakdown_columns.csv"), index=False)
     dect.to_csv(os.path.join(FIG, "fig_codec.csv"), index=False)
     cb = d[(d.exp == "M4C") & (d.cfg == "BASE")].groupby("input").e2e.agg(["mean", "std"])
     cb.to_csv(os.path.join(FIG, "fig_codec_baseline.csv"))
