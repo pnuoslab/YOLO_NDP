@@ -156,7 +156,7 @@ if [ -n "$TARGET_HOST" ]; then
   TARGET_BIN_SHA=$(tssh "sha256sum '$TARGET_BIN' | cut -d' ' -f1" 2>/dev/null || true)
   # Allow-list of measurement builds, and an optional exact-hash pin
   # (EXPECT_TARGET_SHA) so a block can insist on one specific binary.
-  ALLOWED_TARGETS=${ALLOWED_TARGETS:-"nvmf_tgt nvmf_tgt_measure nvmf_tgt_measure_v2 nvmf_tgt_measure_v2_fix"}
+  ALLOWED_TARGETS=${ALLOWED_TARGETS:-"nvmf_tgt nvmf_tgt_measure nvmf_tgt_measure_v2 nvmf_tgt_measure_v2_fix nvmf_tgt_measure_v3"}
   case " $ALLOWED_TARGETS " in
     *" $(basename "$TARGET_BIN") "*) ;;
     *) if [ "$ALLOW_IOTRACE" != 1 ]; then
@@ -544,6 +544,84 @@ if [ "$is_m4" = 1 ]; then
     M4SMOKE)
       ;;
     *) echo "[ERR] unknown M4 step $step" ;;
+    esac
+  done
+  echo
+  echo "runs: $SEQNO"
+  echo "results: $CSV"
+  exit 0
+fi
+
+# ── spec 05-H: blocks M (storage memory, target v3) and R (cv_threads 1) ──
+# M5CHK  the confirmation sequence of section 3-1 (one run each, in order)
+# M5M    block M main runs, one run per condition
+# M5R    block R; repeat numbers continue block A's where they extend a set
+#        (1080p/4K Baseline cv1: reps 4-5 next to 04 D-ref's 1-3)
+M5_STEPS="M5CHK M5M M5R"
+is_m5=0
+for s in "${STEPS[@]:-}"; do case " $M5_STEPS " in *" $s "*) is_m5=1 ;; esac; done
+if [ "$is_m5" = 1 ]; then
+  PT="-post_thresh 0.25 -warmup 3"
+  M=$NVME_MNT
+  NDP6="q85:sws:85 q100:sws:100 raw:sws:raw q85:darknet:85 q100:darknet:100 raw:darknet:raw"
+  m5_ndp() {   # <exp> <tag> <video> <sr> <rep> <extra> <suffix> <pipe:kern:qual...>
+    local exp=$1 tag=$2 v=$3 sr=$4 rep=$5 extra=$6 suf=$7; shift 7
+    local c
+    for c in "$@"; do
+      IFS=: read -r p k q <<< "$c"
+      one_run "$exp" "$tag" "$v" - "$p" "$k" "$q" "$sr" "$rep" 0 "$extra" "$suf"
+    done
+  }
+  block_start() { echo "##### block $1 start $(date -Is) #####"; write_env "$RESULTS/env_$1_$(date +%m%d_%H%M).txt"; }
+  block_end()   { echo "##### block $1 end $(date -Is) #####"; }
+  for step in "${STEPS[@]}"; do
+    case "$step" in
+    M5CHK)
+      block_start M5CHK
+      V="$M/res1080_h264.mp4"; i=0
+      for c in q85:sws:85 raw:sws:raw q85:sws:85 raw:darknet:raw q85:sws:85 q85:sws:85; do
+        i=$((i + 1))
+        m5_ndp M5CHK res1080_h264 "$V" 1 1 "$PT" "_c$i" "$c"
+      done
+      block_end M5CHK ;;
+    M5M)
+      block_start M5M
+      for r in 1080 1440 2160; do
+        m5_ndp M5M "res${r}_h264" "$M/res${r}_h264.mp4" 1 1 "$PT" "" $NDP6
+        for sr in 2 5; do
+          m5_ndp M5M "res${r}_h264" "$M/res${r}_h264.mp4" "$sr" 1 "$PT" "" q85:sws:85 raw:darknet:raw
+        done
+      done
+      for f in res1080_hevc res2160_hevc res1080_av1 res2160_av1; do
+        m5_ndp M5M "$f" "$M/$f.mp4" 1 1 "$PT" "" q85:sws:85 raw:sws:raw q100:darknet:100
+      done
+      for sp in $MOT_SEQS; do
+        IFS=: read -r tag vid lab <<< "$sp"
+        m5_ndp M5M "$tag" "$M/$vid" 1 1 "$PT" "" q85:sws:85 raw:darknet:raw
+      done
+      block_end M5M ;;
+    M5R)
+      block_start M5R
+      CV="$PT -cv_threads 1"
+      for rep in 1 2 3 4 5; do
+        one_run M5R res1440_h264 "$M/res1440_h264.mp4" - BASE sws - 1 "$rep" 0 "$CV" _ct1
+        if [ "$rep" -ge 4 ]; then
+          for r in 1080 2160; do
+            one_run M5R "res${r}_h264" "$M/res${r}_h264.mp4" - BASE sws - 1 "$rep" 0 "$CV" _ct1
+          done
+        fi
+        [ "$rep" -le 3 ] || continue
+        m5_ndp M5R res1440_h264 "$M/res1440_h264.mp4" 1 "$rep" "$CV" _ct1 $NDP6
+        for f in res1080_hevc res2160_hevc res1080_av1 res2160_av1; do
+          one_run M5R "$f" "$M/$f.mp4" - BASE sws - 1 "$rep" 0 "$CV" _ct1
+        done
+        for sp in $MOT_SEQS; do
+          IFS=: read -r tag vid lab <<< "$sp"
+          one_run M5R "$tag" "$M/$vid" - BASE sws - 1 "$rep" 0 "$CV" _ct1
+        done
+      done
+      block_end M5R ;;
+    *) echo "[ERR] unknown M5 step $step" ;;
     esac
   done
   echo

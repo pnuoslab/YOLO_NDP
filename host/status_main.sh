@@ -28,6 +28,8 @@ plan = {"E1": 108, "E5": 24, "E2": 180, "E3": 45}
 if "main04" in root or any(r["exp"].startswith("M4") for r in rows):
     plan = {"M4A": 105, "M4C": 102, "M4Cp": 18, "M4D": 36, "M4Dref": 6,
             "M4E": 105, "M4B": 108, "M4G": 41}
+if "main05" in root or any(r["exp"].startswith("M5") for r in rows):
+    plan = {"M5CHK": 6, "M5M": 52, "M5R": 54}
 print("── progress ──")
 done = {}
 for r in rows:
