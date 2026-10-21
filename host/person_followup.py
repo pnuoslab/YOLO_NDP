@@ -18,7 +18,16 @@ Randomness: block bootstrap only, numpy default_rng(SEED + sequence index),
 SEED = 0, B = 1000.
 
     usage: python3 person_followup.py   -> ~/ndp_analysis/person/out_03c/
+           python3 person_followup.py --dumps ~/ndp_results/main04/dumps \
+                                      --out ~/ndp_analysis/person/out_03c_04
+
+--dumps: a directory holding the sr=1 dumps. 10/19 names
+(E2_<seq>_<pipe>_sws_sr1_r1.csv, E3_<seq>_<pipe>_darknet_sr1_r1.csv) are
+used if present, otherwise spec 04 block G names
+(M4G_<seq>_<pipe>_<kernel>_sr1_r1.csv). Default: the 10/19 dumps.
+Paths are the only thing the arguments change; every definition is as 03c.
 """
+import argparse
 import os
 import sys
 
@@ -138,8 +147,25 @@ def log_comb(a, b):
 
 
 # ── main ───────────────────────────────────────────────────────────────
+def dump_file(dumps_dir, seq, pipe, kern):
+    if dumps_dir is None:
+        return pa.dump_path(seq, pipe, kern, 1)
+    old = os.path.join(dumps_dir, os.path.basename(pa.dump_path(seq, pipe, kern, 1)))
+    if os.path.isfile(old):
+        return old
+    return os.path.join(dumps_dir, f"M4G_{seq}_{pipe}_{kern}_sr1_r1.csv")
+
+
 def main():
+    global OUT
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dumps", default=None, help="directory of sr=1 dumps (default: the 10/19 dumps)")
+    ap.add_argument("--out", default=OUT, help=f"output directory (default: {OUT})")
+    args = ap.parse_args()
+    OUT = os.path.expanduser(args.out)
+    dumps_dir = os.path.expanduser(args.dumps) if args.dumps else None
     os.makedirs(OUT, exist_ok=True)
+    used = []
     bins_rows, fm_rows, fmA_rows, shift_rows, pos_rows = [], [], [], [], []
     km_rows, delay_rows, stab_rows, amb_rows, gh_rows, gh_examples = [], [], [], [], [], []
     seqmean_rows = []
@@ -156,7 +182,12 @@ def main():
         W = boot_weights(n, fps, np.random.default_rng(SEED + si))
         log(seq, "frames", n, "gt", len(gt))
 
-        dumps = {c: frames_of(pa.load_dump(pa.dump_path(seq, c[0], c[1], 1))) for c in [("BASE", "sws")] + CMP}
+        dumps = {}
+        for c in [("BASE", "sws")] + CMP:
+            f_ = dump_file(dumps_dir, seq, c[0], c[1])
+            used.append(dict(seq=seq, cond=NAME[c], file_1019=os.path.basename(pa.dump_path(seq, c[0], c[1], 1)),
+                             file_used=f_))
+            dumps[c] = frames_of(pa.load_dump(f_))
         M = {}
         for c in [("BASE", "sws")] + CMP:
             for N in (pa.NS if c[1] == "sws" else [1]):
@@ -487,6 +518,7 @@ def main():
         rows.append(r)
     sm = sm.merge(pd.DataFrame(rows).assign(N=1), on=["cond", "N"], how="left")
     sm.to_csv(os.path.join(OUT, "seq_mean_summary.csv"), index=False)
+    pd.DataFrame(used).to_csv(os.path.join(OUT, "inputs_used.csv"), index=False)
     log("done:", OUT)
 
 
