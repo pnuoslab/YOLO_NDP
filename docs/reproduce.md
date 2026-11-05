@@ -21,7 +21,7 @@ sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
 git submodule update --init --recursive    # target/spdk/{dpdk,isa-l,isa-l-crypto,intel-ipsec-mb,ocf,libvfio-user,xnvme}
 cd target/spdk
 sudo scripts/pkgdep.sh                     # SPDK's own dependencies (unverified: not recorded on our target)
-./configure --enable-debug                 # REQUIRED to match the paper, see below
+./configure --enable-debug                 # same condition as our measurements, see below
 make -j"$(nproc)"
 cp build/bin/nvmf_tgt build/bin/nvmf_tgt_measure_v3   # optional: name used in our logs
 ```
@@ -33,8 +33,8 @@ cp build/bin/nvmf_tgt build/bin/nvmf_tgt_measure_v3   # optional: name used in o
 > conversion and JPEG encoding times therefore reflect optimized library code.
 > The Darknet-compatible resize (`Dk`) and the SPDK I/O path may run slower
 > than in an optimized build. A plain `./configure` gives an optimized build
-> whose numbers are **not** comparable with the paper. The measurements were
-> not repeated with an optimized build.
+> whose timings are **not** comparable with ours. We did not repeat the
+> measurements with an optimized build.
 
 - Build as a normal user. Building with `sudo make` leaves `dpdk/build`
   owned by root, and a later non-root `make` then fails in the DPDK step.
@@ -68,7 +68,7 @@ The weights are not in this repository.
 > moved by about 6 % between two builds of identical source. The cause was
 > code alignment of the `mat_to_image` loop, confirmed with
 > `-falign-loops=64`. Compare Baseline and NDP only within one `./darknet`
-> binary. The paper's numbers come from a single build of the tree in `host/`.
+> binary. Our numbers come from a single build of the tree in `host/`.
 
 ---
 
@@ -265,7 +265,7 @@ Main settings in `run_all.sh` (environment overrides): `NVME_DEV=/dev/nvme1n1`,
 `run_all.sh` (M4*, S*, pilot steps) are the follow-up measurements described
 in `host/docs/notes/`.
 
-### 4.3 What the paper reports
+### 4.3 Which fields to use
 
 From the target `[NDP-MEASURE]` line:
 
@@ -289,7 +289,7 @@ count equals payload plus the NDP metadata read when the file is opened
 Analysis scripts in `host/` (`analysis_04.py`, `analysis_05.py`,
 `analysis_04_acc.py`, `map_bootstrap.py`, `person_followup.py`,
 `seq_2x2.py`, `codec_breakdown.py`, `make_fig13.py`) turn the CSVs and
-detection dumps into the paper's tables and figure data.
+detection dumps into summary tables and figure data.
 
 ---
 
@@ -336,4 +336,3 @@ files, or raw RGB24 416×416×3 HWC).
 | Exact hugepage command | the recorded command (`HUGEMEM=8192`) does not match the observed 16 GiB |
 | Exact SPDK upstream commit | 24.09-pre was imported as a file snapshot |
 | Source video URL | only the container title survived |
-| Hardware values vs. the paper's Table 1 | read from the machines, not cross-checked |
