@@ -84,7 +84,7 @@ e2e 창 안의 모든 구간에 타이머를 붙였다. 남는 것은 타이머 
 - 파일럿 스텝은 `P3 L1 L2 C1 D1 D1b D2 K1 K2`다.
 - `-dec_threads`는 cdw14로 넘긴다. target 필드 `dec_name`, `dec_threads_req/set`, `thr_peak`, `thr_base`가 행에 들어온다.
 - 링크 확인:
-  - `ip route`에서 192.168.100.0/30은 `enp133s0f0`에만 붙어 있다.
+  - `ip route`에서 <DATA_SUBNET>/30은 `enp133s0f0`에만 붙어 있다.
   - 유휴 10초 동안 rx 360 B, tx 816 B(keep-alive 수준)였다.
 
 ### 2-7. 새 `[MEASURE]` 필드

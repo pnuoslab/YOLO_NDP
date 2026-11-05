@@ -244,7 +244,7 @@ nvme-subsys0 - NQN=...BTLN914202M51P6AGN  INTEL SSDPE2KE016T8
 - 결론: 명세의 수동 절차가 그대로 기록돼 있고, **영상 복사 후 `sync` 는 했지만 페이지 캐시는 비우지 않았다.** 따라서 복사 직후 돌린 Baseline은 파일이 host 페이지 캐시에 더운 상태였다.
 - 근거: `~/.bash_history:1975-1995` (4K 실험 직전 구간, 발췌)
   ```
-  1975  sudo nvme connect -t tcp -n nqn.2016-06.io.spdk:cnode1 -a 192.168.100.2 -s 4420
+  1975  sudo nvme connect -t tcp -n nqn.2016-06.io.spdk:cnode1 -a <TARGET_DATA_IP> -s 4420
   1976  sudo mkfs.ext4 /dev/nvme1n1
   1978  sudo mount /dev/nvme1n1 /mnt/ext4
   1980  sudo cp testd_15s.mp4 /mnt/ext4/
@@ -366,8 +366,8 @@ nvme-subsys0 - NQN=...BTLN914202M51P6AGN  INTEL SSDPE2KE016T8
 | OpenCV | **4.6.0** | `pkg-config --modversion opencv4` |
 | FFmpeg | **6.1.1-3ubuntu5** | `ffmpeg -version` |
 | Darknet 커밋 | `bfb91d3ce5e6d2224134f708c8e8ca4cbe2bae0c` (2026-08-14) "Add per-frame image/log output and remove scaler ablation option" | `git log -1` |
-| NVMe-oF NIC | `enp133s0f0`, **10,000 Mb/s (10GbE)**, 192.168.100.1/30 | `ethtool`, `ip route get 192.168.100.2` |
-| target 주소 | 192.168.100.2:4420, NQN `nqn.2016-06.io.spdk:cnode1`, transport tcp | `~/.bash_history:1975` |
+| NVMe-oF NIC | `enp133s0f0`, **10,000 Mb/s (10GbE)**, <HOST_DATA_IP>/30 | `ethtool`, `ip route get <TARGET_DATA_IP>` |
+| target 주소 | <TARGET_DATA_IP>:4420, NQN `nqn.2016-06.io.spdk:cnode1`, transport tcp | `~/.bash_history:1975` |
 | NVMe-oF 연결 | **현재 미연결** (로컬 `nvme0n1` = INTEL SSDPE2KE016T8 만 live) | `nvme list-subsys` |
 
 - **중요**: 측정에 쓴 바이너리(`./darknet`, 2026-09-14 20:00)는 **커밋되지 않은 작업 트리**에서 빌드됐다. `git diff --stat` → `src/detector.c` +250/-28, `src/image_opencv.cpp` +22, `src/image_opencv.h` +1. 위에서 인용한 줄번호는 모두 **작업 트리(미커밋) 상태**를 가리킨다. 논문 제출 전에 커밋해 재현 가능한 리비전을 확보해야 한다.

@@ -19,7 +19,7 @@
 
 | 필요한 것 | 어떻게 해결했나 |
 |---|---|
-| host → target 접속 | supercxl(<host-lan-ip>)과 target(<target-lan-ip>)이 같은 LAN. `~/.ssh/config` 별칭 `target-server3`(포트 <ssh-port>), 이 host 전용 키 `~/.ssh/id_ed25519_ndp`. bastion 불필요 |
+| host → target 접속 | supercxl(<HOST_LAN_IP>)과 target(<TARGET_LAN_IP>)이 같은 LAN. `~/.ssh/config` 별칭 `target-server3`(포트 <SSH_PORT>), 이 host 전용 키 `~/.ssh/id_ed25519_ndp`. bastion 불필요 |
 | target을 sudo 없이 기동 | `/dev/vfio/4`·`/dev/hugepages`가 kimkitae 소유, memlock 8.2 GB, NVMe `82:00.0`이 `vfio-pci`. **`nvmf_tgt_measure`를 kimkitae 권한으로 기동 성공** — 프로세스·RPC 소켓·lock 파일 모두 kimkitae 소유 |
 | `conf_subsystem.sh`의 `sudo rpc.py` | 소켓이 kimkitae 소유가 되므로 같은 RPC 6개를 sudo 없이 실행 |
 | root로 떠 있던 target 종료 | RPC `spdk_kill_instance SIGTERM`(소켓 666) → 정상 종료 시 `/var/tmp`의 root 소유 lock·소켓 파일까지 SPDK가 스스로 지움 |
@@ -37,8 +37,8 @@ $R nvmf_create_transport -t TCP -u 131072 -m 20 -c 8192 -i 2097152
 $R bdev_nvme_attach_controller -b nvme1 -t PCIe -a 0000:82:00.0
 $R nvmf_create_subsystem nqn.2016-06.io.spdk:cnode1 -a -s SPDK00000000000001 -d nvme1n1
 $R nvmf_subsystem_add_ns nqn.2016-06.io.spdk:cnode1 nvme1n1
-$R nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t tcp -a 192.168.100.2 -s 4420
-$R nvmf_subsystem_add_listener nqn.2014-08.org.nvmexpress.discovery -t tcp -a 192.168.100.2 -s 4420
+$R nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t tcp -a <TARGET_DATA_IP> -s 4420
+$R nvmf_subsystem_add_listener nqn.2014-08.org.nvmexpress.discovery -t tcp -a <TARGET_DATA_IP> -s 4420
 ```
 `pci_event ... Socket recv buffer is too small` 오류는 root가 아니라 핫플러그 소켓 버퍼를 못 늘린 것뿐이고 동작에는 영향이 없다.
 
@@ -76,4 +76,4 @@ sudo ./queue_main.sh E2 E3      # 지금 블록이 끝나면 자동 시작
 - "사용자가 직접 실행" 규칙은 **sudo 비밀번호가 꼭 필요한 host 단계에만** 남긴다. target 쪽은 host Claude가 한다.
 - host·target이 만나는 절차는 **양쪽 명세에 같은 명령을 직접 적는다.** 각 Claude는 자기에게 온 명세만 본다(target 보고서 §10-4와 같은 요청).
 - 정확한 경로와 이름(이번에 실제로 쓴 값):
-  target `target-server3` = <target-lan-ip>:<ssh-port> · 바이너리 `~/near_data_processing_for_video/spdk/build/bin/nvmf_tgt_measure` · RPC `~/near_data_processing_for_video/spdk/scripts/rpc.py`(기본 소켓) · 로그 `~/nvmf_tgt_measure.log` · host 볼륨 `/dev/nvme1n1` → `/mnt/ext4` · 결과 `~/ndp_results/main/`
+  target `target-server3` = <TARGET_LAN_IP>:<SSH_PORT> · 바이너리 `~/near_data_processing_for_video/spdk/build/bin/nvmf_tgt_measure` · RPC `~/near_data_processing_for_video/spdk/scripts/rpc.py`(기본 소켓) · 로그 `~/nvmf_tgt_measure.log` · host 볼륨 `/dev/nvme1n1` → `/mnt/ext4` · 결과 `~/ndp_results/main/`

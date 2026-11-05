@@ -416,15 +416,15 @@ Baseline 세부 타이머:
 
 ## 4-4. target 수집 경로 확인 — **ALL OK** (2026-10-19 06:2x)
 
-사용자 PC의 ssh 설정에서 target이 `target-server3` = **<target-lan-ip>:<ssh-port>**, 계정 `kimkitae` 임을 확인했다. supercxl(<host-lan-ip>)이 같은 LAN이라 bastion 없이 직접 닿는다.
+사용자 PC의 ssh 설정에서 target이 `target-server3` = **<TARGET_LAN_IP>:<SSH_PORT>**, 계정 `kimkitae` 임을 확인했다. supercxl(<HOST_LAN_IP>)이 같은 LAN이라 bastion 없이 직접 닿는다.
 
 조치:
-- `~/.ssh/config` 에 `Host target-server3 oslab-server3` → `<target-lan-ip>:<ssh-port>` (`oslab-server3` 는 9월 스크립트가 쓰던 이름 — target의 실제 호스트명도 `oslab-server3` 다). `/etc/hosts` 수정 불필요, sudo 불필요.
+- `~/.ssh/config` 에 `Host target-server3 oslab-server3` → `<TARGET_LAN_IP>:<SSH_PORT>` (`oslab-server3` 는 9월 스크립트가 쓰던 이름 — target의 실제 호스트명도 `oslab-server3` 다). `/etc/hosts` 수정 불필요, sudo 불필요.
 - 이 host 전용 키 `~/.ssh/id_ed25519_ndp` 생성(무인 실행용, passphrase 없음), 사용자가 `ssh-copy-id` 로 target에 설치.
-- target 호스트 키 고정: `SHA256:heL7+DuNrrLIQnBkP/AQ8oWKckY61LtiZjGwU5RLGsw` (ED25519, `[<target-lan-ip>]:<ssh-port>`).
+- target 호스트 키 고정: `SHA256:heL7+DuNrrLIQnBkP/AQ8oWKckY61LtiZjGwU5RLGsw` (ED25519, `[<TARGET_LAN_IP>]:<SSH_PORT>`).
 - target의 실제 경로로 기본값 교체: RPC `~/near_data_processing_for_video/spdk/scripts/rpc.py`(소켓 `/var/tmp/spdk.sock` 이 `srw-rw-rw-` 라 sudo 불필요), 로그 `~/nvmf_tgt_iotest.log`(nvmf_tgt stdout을 `tee` 한 파일). 9월 스크립트의 `/root/spdk`, `/var/log/spdk_tgt.log` 는 둘 다 맞지 않았다.
 
-`./check_target.sh` 결과: 이름 해석 → <ssh-port> 포트 → 키 로그인 → `bdev_get_iostat`(bdev `nvme1n1`) → 로그 읽기 → **`[NDP-MEASURE]` 가 `run_id` 를 echo** — 전부 OK.
+`./check_target.sh` 결과: 이름 해석 → <SSH_PORT> 포트 → 키 로그인 → `bdev_get_iostat`(bdev `nvme1n1`) → 로그 읽기 → **`[NDP-MEASURE]` 가 `run_id` 를 echo** — 전부 OK.
 
 ### 스모크 실행의 소급 짝짓기 — 성공
 
@@ -629,8 +629,8 @@ target 세션이 `nvmf_tgt` 를 띄운 뒤 4420이 열렸고(`4420 OPEN`), 사�
 `nvme connect` 가 실패하는 이유는 입력 오류가 아니다. target에 SPDK가 안 떠 있다:
 
 ```
-$ ping -c2 192.168.100.2        → 0% loss, 0.2 ms      (머신과 링크는 정상)
-$ /dev/tcp/192.168.100.2/4420   → Connection refused   (nvmf_tgt 미동작)
+$ ping -c2 <TARGET_DATA_IP>        → 0% loss, 0.2 ms      (머신과 링크는 정상)
+$ /dev/tcp/<TARGET_DATA_IP>/4420   → Connection refused   (nvmf_tgt 미동작)
 $ nvme list-subsys              → 로컬 PCIe SSD 하나뿐, nvme1n1 없음
 $ ls -ld /mnt/ext4              → No such file or directory
 ```
@@ -647,7 +647,7 @@ $ ls -ld /mnt/ext4              → No such file or directory
 사용자가 쓰는 정확한 순서 (**`mkdir` 이 필요하다** — 앞선 판에서 빠져 있었다):
 
 ```bash
-sudo nvme connect -t tcp -n nqn.2016-06.io.spdk:cnode1 -a 192.168.100.2 -s 4420
+sudo nvme connect -t tcp -n nqn.2016-06.io.spdk:cnode1 -a <TARGET_DATA_IP> -s 4420
 sudo mkfs.ext4 /dev/nvme1n1        # 볼륨 전체를 지움 — 직접 실행해 주세요
 sudo mkdir /mnt/ext4
 sudo mount /dev/nvme1n1 /mnt/ext4
@@ -687,11 +687,11 @@ ssh: Could not resolve hostname oslab-server3: Temporary failure in name resolut
 $ grep oslab /etc/hosts        → 없음
 $ ls ~/.ssh/config             → 파일 없음
 
-$ ssh 192.168.100.2
-ssh: connect to host 192.168.100.2 port 22: Connection refused
+$ ssh <TARGET_DATA_IP>
+ssh: connect to host <TARGET_DATA_IP> port 22: Connection refused
 ```
 
-즉 storage 링크(192.168.100.2)에는 sshd가 없고, `oslab-server3` 라는 이름을 풀 방법도 남아 있지 않다. 9월에는 동작했으므로 DNS 또는 root 계정의 ssh 설정이 바뀐 것으로 보인다(**추정** — `/root/.ssh` 는 읽을 수 없다. 9월 실행이 `sudo -E ./run_measure.sh` 였으므로 ssh는 root로 나갔다).
+즉 storage 링크(<TARGET_DATA_IP>)에는 sshd가 없고, `oslab-server3` 라는 이름을 풀 방법도 남아 있지 않다. 9월에는 동작했으므로 DNS 또는 root 계정의 ssh 설정이 바뀐 것으로 보인다(**추정** — `/root/.ssh` 는 읽을 수 없다. 9월 실행이 `sudo -E ./run_measure.sh` 였으므로 ssh는 root로 나갔다).
 
 **영향**: ssh가 없으면 `run_all.sh` 의 target 관련 열(`tgt_bytes_read` 등 iostat 차분, target `[NDP-MEASURE]`)이 전부 비고, §6-7 대조도 못 한다. 스크립트는 ssh 실패를 무시하고 진행하도록 돼 있어 측정 자체는 멈추지 않지만, **"NDP의 0xC0이 SSD에서 파일 크기만큼 읽었는가"를 확인할 수 없게 된다** — 명세 §9의 확인 항목 중 하나다.
 
